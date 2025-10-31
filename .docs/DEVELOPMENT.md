@@ -11,7 +11,7 @@
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/your-org/rtsp-client.git
+git clone https://github.com/YOUR_USERNAME/rtsp-client.git
 cd rtsp-client
 ```
 

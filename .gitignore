@@ -1,41 +1,51 @@
 # Binaries
+bin/
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-bin/
 rtsp-client
 
-# Test binary
+# Test binary, built with `go test -c`
 *.test
 
 # Output of the go coverage tool
 *.out
 coverage.html
 
-# Go workspace file
-go.work
-
 # Dependency directories
 vendor/
 
-# IDE
+# Go workspace file
+go.work
+
+# IDE files
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
 
-# Output frames
-frames/
-*.jpg
-*.jpeg
-*.png
-*.h264
-
-# OS
+# OS files
 .DS_Store
 Thumbs.db
 
+# Build artifacts
+*.o
+*.a
 
+# Frame output directories
+frames/
+*.h264
+*.jpg
+*.jpeg
+
+# Log files
+*.log
+test_*.log
+
+# Temporary files
+tmp/
+temp/
+.docs

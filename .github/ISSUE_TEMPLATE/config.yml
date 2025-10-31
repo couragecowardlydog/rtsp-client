@@ -1,0 +1,9 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & Discussions
+    url: https://github.com/YOUR_USERNAME/rtsp-client/discussions
+    about: Ask questions and discuss ideas with the community
+  - name: Security Vulnerability
+    url: https://github.com/YOUR_USERNAME/rtsp-client/security/advisories/new
+    about: Report a security vulnerability (please don't use regular issues)
+

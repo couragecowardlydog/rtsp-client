@@ -6,6 +6,18 @@
 
 A production-ready, test-driven RTSP client written in Go from scratch. Connects to RTSP streams, receives RTP packets, decodes H.264 video frames, and saves them with timestamp-based naming.
 
+## ⚠️ Disclaimer
+
+**This repository contains AI-generated code. Use it at your own risk.**
+
+This software is provided "as is", without warranty of any kind. While efforts have been made to ensure functionality, users should:
+- Review the code before use in production environments
+- Test thoroughly in their specific use cases
+- Not rely solely on this software for critical applications
+- Report any issues or bugs found
+
+The maintainers assume no liability for any damages arising from the use of this software.
+
 ## ✨ Features
 
 - 🎥 **Full RTSP Protocol Support**: DESCRIBE, SETUP, PLAY, TEARDOWN
@@ -27,7 +39,7 @@ A production-ready, test-driven RTSP client written in Go from scratch. Connects
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-org/rtsp-client.git
+git clone https://github.com/YOUR_USERNAME/rtsp-client.git
 cd rtsp-client
 
 # Build the binary
@@ -240,8 +252,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 📞 Support
 
 - 📖 [Documentation](.docs/)
-- 🐛 [Issue Tracker](https://github.com/your-org/rtsp-client/issues)
-- 💬 [Discussions](https://github.com/your-org/rtsp-client/discussions)
+- 🐛 [Issue Tracker](https://github.com/YOUR_USERNAME/rtsp-client/issues)
+- 💬 [Discussions](https://github.com/YOUR_USERNAME/rtsp-client/discussions)
 
 ## ⭐ Star History
 

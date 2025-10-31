@@ -48,4 +48,3 @@ test_*.log
 # Temporary files
 tmp/
 temp/
-.docs

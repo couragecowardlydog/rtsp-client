@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
 	"strconv"
@@ -316,6 +317,10 @@ func (c *Client) ReadPacket() (*rtp.Packet, error) {
 				if err != nil {
 					return nil, fmt.Errorf("failed to parse RTP packet: %w", err)
 				}
+				// Log RTP header details immediately after parsing
+				log.Printf("[RTP:ReadPacket:TCP] 📦 RTP Header: Version=%d, Padding=%t, Extension=%t, Marker=%t, PayloadType=%d, SeqNum=%d, Timestamp=%d, SSRC=0x%x, PayloadSize=%d bytes, Channel=%d",
+					packet.Version, packet.Padding, packet.Extension, packet.Marker, packet.PayloadType,
+					packet.SequenceNumber, packet.Timestamp, packet.SSRC, len(packet.Payload), channel)
 				c.validatePayloadType(packet)
 				return packet, nil
 			}
@@ -344,6 +349,10 @@ func (c *Client) ReadPacket() (*rtp.Packet, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse RTP packet: %w", err)
 	}
+	// Log RTP header details immediately after parsing
+	log.Printf("[RTP:ReadPacket:UDP] 📦 RTP Header: Version=%d, Padding=%t, Extension=%t, Marker=%t, PayloadType=%d, SeqNum=%d, Timestamp=%d, SSRC=0x%x, PayloadSize=%d bytes",
+		packet.Version, packet.Padding, packet.Extension, packet.Marker, packet.PayloadType,
+		packet.SequenceNumber, packet.Timestamp, packet.SSRC, len(packet.Payload))
 
 	c.validatePayloadType(packet)
 

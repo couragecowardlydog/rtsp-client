@@ -41,7 +41,7 @@ go install ./cmd/rtsp-client/
 
 ```bash
 # Connect to an RTSP stream
-./bin/rtsp-client -url rtsp://192.168.1.100:554/stream
+./bin/rtsp-client -url rtsp://127.0.0.1:8554/stream
 
 # Specify output directory
 ./bin/rtsp-client -url rtsp://192.168.1.100:554/stream -output ./frames

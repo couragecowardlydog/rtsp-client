@@ -195,6 +195,331 @@ func (d *H264Decoder) ProcessPacket(packet *rtp.Packet) *Frame {
 	return nil
 }
 
+// getOrCreateFrameAssembly gets or creates a frame assembly for a timestamp
+func (d *H264Decoder) getOrCreateFrameAssembly(timestamp uint32) *FrameAssembly {
+	if fa, ok := d.frameMap[timestamp]; ok {
+		return fa
+	}
+
+	fa := &FrameAssembly{
+		timestamp:    timestamp,
+		packets:      make(map[uint16]*rtp.Packet),
+		firstArrival: time.Now(),
+	}
+	d.frameMap[timestamp] = fa
+	return fa
+}
+
+// shouldFinalizeFrame determines if a frame should be finalized
+func (d *H264Decoder) shouldFinalizeFrame(fa *FrameAssembly) bool {
+	// If marker bit received, frame is complete
+	if fa.markerReceived {
+		return true
+	}
+
+	// If reordering window expired, finalize even without marker
+	elapsed := time.Since(fa.firstArrival)
+	if elapsed > reorderWindowMs*time.Millisecond {
+		return true
+	}
+
+	return false
+}
+
+// checkFramePacketLoss checks for missing sequence numbers within a frame
+func (d *H264Decoder) checkFramePacketLoss(fa *FrameAssembly) {
+	// Check for gaps in sequence numbers
+	if len(fa.packets) < 2 {
+		return
+	}
+
+	// Get sorted sequence numbers
+	seqs := make([]uint16, 0, len(fa.packets))
+	for seq := range fa.packets {
+		seqs = append(seqs, seq)
+	}
+	sort.Slice(seqs, func(i, j int) bool {
+		return sequenceBefore(seqs[i], seqs[j])
+	})
+
+	// Check for gaps
+	for i := 1; i < len(seqs); i++ {
+		expectedSeq := seqs[i-1] + 1
+		if seqs[i] != expectedSeq {
+			gap := sequenceDifference(expectedSeq, seqs[i])
+			if gap > 0 && gap < 100 {
+				// Packet loss detected
+				fa.hasPacketLoss = true
+				return
+			}
+		}
+	}
+}
+
+// finalizeFrame reassembles packets into a complete frame
+func (d *H264Decoder) finalizeFrame(fa *FrameAssembly) *Frame {
+	if len(fa.packets) == 0 {
+		return nil
+	}
+
+	// Get sorted sequence numbers for ordered processing
+	seqs := make([]uint16, 0, len(fa.packets))
+	for seq := range fa.packets {
+		seqs = append(seqs, seq)
+	}
+	sort.Slice(seqs, func(i, j int) bool {
+		return sequenceBefore(seqs[i], seqs[j])
+	})
+
+	// Reassemble frame
+	var frameData []byte
+	var hasIDR bool
+	var isCorrupted = fa.hasPacketLoss
+
+	// Track FU-A fragmentation state
+	var fuaState struct {
+		active    bool
+		nalHeader byte
+		started   bool
+		ended     bool
+	}
+
+	for _, seq := range seqs {
+		packet := fa.packets[seq]
+		payload := packet.Payload
+
+		if len(payload) == 0 {
+			continue
+		}
+
+		// Check NAL unit type
+		nalType := payload[0] & 0x1F
+
+		switch nalType {
+		case nalUnitTypeSTAP:
+			// STAP-A: Multiple NAL units in one packet
+			nalUnits := d.unpackSTAPA(payload)
+			for _, nal := range nalUnits {
+				// Extract and cache SPS/PPS
+				extractedType := nal[0] & 0x1F
+				if extractedType == nalUnitTypeSPS {
+					d.spsNAL = append([]byte{}, startCode...)
+					d.spsNAL = append(d.spsNAL, nal...)
+				} else if extractedType == nalUnitTypePPS {
+					d.ppsNAL = append([]byte{}, startCode...)
+					d.ppsNAL = append(d.ppsNAL, nal...)
+				} else if extractedType == nalUnitTypeIDR {
+					hasIDR = true
+				}
+
+				frameData = append(frameData, startCode...)
+				frameData = append(frameData, nal...)
+			}
+
+		case nalUnitTypeFUA:
+			// FU-A fragmentation
+			if len(payload) < 2 {
+				isCorrupted = true
+				continue
+			}
+
+			fuHeader := payload[1]
+			isStart := (fuHeader >> 7) & 0x01
+			isEnd := (fuHeader >> 6) & 0x01
+
+			if isStart == 1 {
+				// Start of FU-A
+				if fuaState.active {
+					// Previous FU-A not ended, corruption
+					isCorrupted = true
+				}
+				fuaState.active = true
+				fuaState.started = true
+				fuaState.ended = false
+
+				// Reconstruct NAL header
+				extractedType := fuHeader & 0x1F
+				fnri := payload[0] & 0xE0
+				fuaState.nalHeader = fnri | extractedType
+
+				// Extract and cache SPS/PPS
+				if extractedType == nalUnitTypeSPS {
+					d.spsNAL = append([]byte{}, startCode...)
+					d.spsNAL = append(d.spsNAL, fuaState.nalHeader)
+				} else if extractedType == nalUnitTypePPS {
+					d.ppsNAL = append([]byte{}, startCode...)
+					d.ppsNAL = append(d.ppsNAL, fuaState.nalHeader)
+				} else if extractedType == nalUnitTypeIDR {
+					hasIDR = true
+				}
+
+				// Add start code and NAL header
+				frameData = append(frameData, startCode...)
+				frameData = append(frameData, fuaState.nalHeader)
+
+				// Add payload (skip FU indicator and FU header)
+				if len(payload) > 2 {
+					frameData = append(frameData, payload[2:]...)
+				}
+			} else if isEnd == 1 {
+				// End of FU-A
+				if !fuaState.active || !fuaState.started {
+					isCorrupted = true
+					fuaState.active = false
+					continue
+				}
+				fuaState.ended = true
+				fuaState.active = false
+
+				// Add payload (skip FU indicator and FU header)
+				if len(payload) > 2 {
+					frameData = append(frameData, payload[2:]...)
+				}
+			} else {
+				// Middle fragment
+				if !fuaState.active || !fuaState.started {
+					isCorrupted = true
+					continue
+				}
+
+				// Add payload (skip FU indicator and FU header)
+				if len(payload) > 2 {
+					frameData = append(frameData, payload[2:]...)
+				}
+			}
+
+		default:
+			// Single NAL unit
+			if fuaState.active && !fuaState.ended {
+				// FU-A not properly ended
+				isCorrupted = true
+				fuaState.active = false
+			}
+
+			// Extract and cache SPS/PPS
+			if nalType == nalUnitTypeSPS {
+				d.spsNAL = append([]byte{}, startCode...)
+				d.spsNAL = append(d.spsNAL, payload...)
+			} else if nalType == nalUnitTypePPS {
+				d.ppsNAL = append([]byte{}, startCode...)
+				d.ppsNAL = append(d.ppsNAL, payload...)
+			} else if nalType == nalUnitTypeIDR {
+				hasIDR = true
+			}
+
+			// Add start code and NAL unit
+			frameData = append(frameData, startCode...)
+			frameData = append(frameData, payload...)
+		}
+	}
+
+	// If FU-A was started but not properly ended, mark as corrupted
+	if fuaState.active && !fuaState.ended {
+		isCorrupted = true
+	}
+
+	// If frame has no data, return nil
+	if len(frameData) == 0 {
+		return nil
+	}
+
+	// For IDR frames, prepend SPS/PPS if available
+	if hasIDR && len(d.spsNAL) > 0 && len(d.ppsNAL) > 0 {
+		// Check if frame already has SPS/PPS
+		hasSPS := d.frameHasNAL(frameData, nalUnitTypeSPS)
+		hasPPS := d.frameHasNAL(frameData, nalUnitTypePPS)
+
+		if !hasSPS || !hasPPS {
+			// Prepend SPS/PPS
+			prepended := make([]byte, 0, len(d.spsNAL)+len(d.ppsNAL)+len(frameData))
+			prepended = append(prepended, d.spsNAL...)
+			prepended = append(prepended, d.ppsNAL...)
+			prepended = append(prepended, frameData...)
+			frameData = prepended
+		}
+	}
+
+	// If corrupted and we're dropping corrupted frames, return nil
+	if isCorrupted && d.dropCorruptedFrames {
+		d.stats.CorruptedFrames++
+		return nil
+	}
+
+	// Create frame
+	frame := &Frame{
+		Data:        frameData,
+		Timestamp:   fa.timestamp,
+		IsCorrupted: isCorrupted,
+	}
+	frame.IsKey = frame.IsKeyFrame()
+
+	// Update statistics
+	d.stats.TotalFrames++
+	if frame.IsCorrupted {
+		d.stats.CorruptedFrames++
+	}
+
+	return frame
+}
+
+// unpackSTAPA unpacks a STAP-A packet into individual NAL units
+func (d *H264Decoder) unpackSTAPA(payload []byte) [][]byte {
+	if len(payload) < 1 {
+		return nil
+	}
+
+	var nalUnits [][]byte
+	offset := 1 // Skip STAP-A indicator
+
+	for offset < len(payload) {
+		if offset+2 > len(payload) {
+			break
+		}
+
+		// Read NAL unit size (2 bytes, big-endian)
+		nalSize := uint16(payload[offset])<<8 | uint16(payload[offset+1])
+		offset += 2
+
+		if offset+int(nalSize) > len(payload) {
+			break
+		}
+
+		// Extract NAL unit
+		nalUnit := payload[offset : offset+int(nalSize)]
+		nalUnits = append(nalUnits, nalUnit)
+		offset += int(nalSize)
+	}
+
+	return nalUnits
+}
+
+// frameHasNAL checks if frame contains a specific NAL type
+func (d *H264Decoder) frameHasNAL(frameData []byte, nalType byte) bool {
+	for i := 0; i <= len(frameData)-startCodeSize-1; i++ {
+		// Look for start code
+		if frameData[i] == 0x00 && frameData[i+1] == 0x00 {
+			if (i+3 < len(frameData) && frameData[i+2] == 0x00 && frameData[i+3] == 0x01) ||
+				(i+2 < len(frameData) && frameData[i+2] == 0x01) {
+
+				var nalStart int
+				if frameData[i+2] == 0x01 {
+					nalStart = i + 3
+				} else {
+					nalStart = i + 4
+				}
+
+				if nalStart < len(frameData) {
+					foundType := frameData[nalStart] & 0x1F
+					if foundType == nalType {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
 // detectPacketLoss checks if there's a gap in sequence numbers
 func (d *H264Decoder) detectPacketLoss(currentSeq uint16) bool {
 	if !d.sequenceInit {
@@ -203,19 +528,19 @@ func (d *H264Decoder) detectPacketLoss(currentSeq uint16) bool {
 
 	// Handle sequence number wraparound (65535 -> 0)
 	expectedSeq := d.expectedSequence
-	
+
 	// Check if current sequence is what we expected
 	if currentSeq != expectedSeq {
 		// Calculate gap size (handling wraparound)
 		gap := sequenceDifference(expectedSeq, currentSeq)
-		
+
 		// If gap is 1-100, it's likely packet loss
 		// If gap > 32000, it's probably wraparound or old packet
 		if gap > 0 && gap < 100 {
 			return true
 		}
 	}
-	
+
 	return false
 }
 
@@ -228,100 +553,27 @@ func sequenceDifference(seq1, seq2 uint16) uint16 {
 	return (65535 - seq1) + seq2 + 1
 }
 
-// processSingleNAL processes a single NAL unit packet
-func (d *H264Decoder) processSingleNAL(packet *rtp.Packet) *Frame {
-	// Add start code and NAL unit to buffer
-	d.buffer = append(d.buffer, startCode...)
-	d.buffer = append(d.buffer, packet.Payload...)
-
-	// If marker bit is set, frame is complete
-	if packet.Marker {
-		frame := d.createFrame()
-		d.Reset()
-		return frame
-	}
-
-	return nil
+// sequenceBefore returns true if seq1 comes before seq2 (wrap-aware)
+func sequenceBefore(seq1, seq2 uint16) bool {
+	diff := sequenceDifference(seq1, seq2)
+	return diff < 32768 // Less than half the space = seq1 before seq2
 }
 
-// processFUA processes a Fragmentation Unit A packet
-func (d *H264Decoder) processFUA(packet *rtp.Packet) *Frame {
-	if len(packet.Payload) < 2 {
-		return nil
-	}
-
-	fuHeader := packet.Payload[1]
-	isStart := (fuHeader >> 7) & 0x01
-	isEnd := (fuHeader >> 6) & 0x01
-
-	if isStart == 1 {
-		// Start of fragmented NAL unit
-		d.fragmenting = true
-
-		// Reconstruct NAL header
-		nalType := fuHeader & 0x1F
-		fnri := packet.Payload[0] & 0xE0
-		nalHeader := fnri | nalType
-
-		// Add start code and NAL header
-		d.buffer = append(d.buffer, startCode...)
-		d.buffer = append(d.buffer, nalHeader)
-
-		// Add payload (skip FU indicator and FU header)
-		if len(packet.Payload) > 2 {
-			d.buffer = append(d.buffer, packet.Payload[2:]...)
-		}
-	} else {
-		// Middle or end fragment
-		if len(packet.Payload) > 2 {
-			d.buffer = append(d.buffer, packet.Payload[2:]...)
-		}
-	}
-
-	// Check if this is the end of the fragmented NAL unit
-	if isEnd == 1 || packet.Marker {
-		d.fragmenting = false
-		frame := d.createFrame()
-		d.Reset()
-		return frame
-	}
-
-	return nil
+// sequenceAfter returns true if seq1 comes after seq2 (wrap-aware)
+func sequenceAfter(seq1, seq2 uint16) bool {
+	return sequenceBefore(seq2, seq1)
 }
 
-// createFrame creates a Frame from the current buffer
-func (d *H264Decoder) createFrame() *Frame {
-	if len(d.buffer) == 0 {
-		return nil
-	}
-
-	// Copy buffer to frame data
-	frameData := make([]byte, len(d.buffer))
-	copy(frameData, d.buffer)
-
-	frame := &Frame{
-		Data:        frameData,
-		Timestamp:   d.currentTimestamp,
-		IsCorrupted: d.packetLossDetected,
-	}
-
-	frame.IsKey = frame.IsKeyFrame()
-
-	// Update statistics
-	d.stats.TotalFrames++
-	if frame.IsCorrupted {
-		d.stats.CorruptedFrames++
-	}
-
-	return frame
-}
 
 // Reset resets the decoder state
 func (d *H264Decoder) Reset() {
-	d.buffer = d.buffer[:0]
-	d.fragmenting = false
-	d.packetLossDetected = false
+	// Clear all frame assemblies
+	for k := range d.frameMap {
+		delete(d.frameMap, k)
+	}
+	d.currentFrame = nil
 	// Note: Don't reset SSRC tracking - it persists across frame boundaries
+	// Note: Don't reset SPS/PPS - they remain valid until SSRC changes
 }
 
 // GetCurrentSSRC returns the current stream SSRC

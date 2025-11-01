@@ -78,6 +78,118 @@ Set a custom connection timeout:
   -verbose
 ```
 
+## YAML Configuration File
+
+The RTSP client supports YAML configuration files (similar to mediamtx) for easier configuration management. This is especially useful for production deployments where you want to store configuration separately from command-line arguments.
+
+### Creating a Configuration File
+
+1. **Copy the example configuration**:
+   ```bash
+   cp rtsp-client.yml.example rtsp-client.yml
+   ```
+
+2. **Edit the configuration file** with your settings:
+   ```yaml
+   rtsp_url: "rtsp://192.168.1.100:554/stream"
+   output_dir: "./frames"
+   timeout: "10s"
+   verbose: false
+   save_jpeg: true
+   continuous_decoder: true
+   ```
+
+### Using the Configuration File
+
+#### Basic Usage
+```bash
+./bin/rtsp-client rtsp-client.yml
+```
+
+#### Override YAML Settings with Flags
+Command-line flags always override YAML values:
+```bash
+# Use YAML config but enable verbose logging
+./bin/rtsp-client rtsp-client.yml -verbose
+
+# Use YAML config but change output directory
+./bin/rtsp-client rtsp-client.yml -output /custom/frames
+
+# Use YAML config but override URL and timeout
+./bin/rtsp-client rtsp-client.yml -url rtsp://other-server/stream -timeout 30s
+```
+
+### Configuration Priority
+
+The priority order for configuration values is:
+1. **Defaults** (built-in default values)
+2. **YAML file** (overrides defaults)
+3. **Command-line flags** (override YAML and defaults)
+
+### Configuration File Options
+
+| Option | YAML Key | Type | Default | Description |
+|--------|----------|------|---------|-------------|
+| RTSP URL | `rtsp_url` | string | - | RTSP stream URL (required) |
+| Output Directory | `output_dir` | string | `./frames` | Directory for saved frames |
+| Timeout | `timeout` | string | `10s` | Connection timeout (duration format) |
+| Verbose | `verbose` | boolean | `false` | Enable verbose logging |
+| Save JPEG | `save_jpeg` | boolean | `true` | Save frames as JPEG images (requires ffmpeg) |
+| Continuous Decoder | `continuous_decoder` | boolean | `true` | Use continuous decoder (can decode P-frames) |
+
+### Example Configuration Files
+
+#### Minimal Configuration
+```yaml
+rtsp_url: "rtsp://192.168.1.100:554/stream"
+```
+
+#### Full Configuration
+```yaml
+rtsp_url: "rtsp://admin:password@192.168.1.100:554/stream"
+output_dir: "/data/camera1/frames"
+timeout: "30s"
+verbose: true
+save_jpeg: true
+continuous_decoder: true
+```
+
+#### Production Configuration
+```yaml
+rtsp_url: "rtsp://camera.example.com:554/main_stream"
+output_dir: "/var/lib/rtsp-client/frames"
+timeout: "15s"
+verbose: false
+save_jpeg: true
+continuous_decoder: true
+```
+
+### YAML File Location
+
+You can place the YAML configuration file anywhere and reference it by path:
+```bash
+# Use absolute path
+./bin/rtsp-client /etc/rtsp-client/config.yml
+
+# Use relative path
+./bin/rtsp-client ./configs/camera1.yml
+
+# Use from any location
+./bin/rtsp-client /home/user/rtsp-configs/production.yml
+```
+
+### Combining YAML with Examples Scripts
+
+The example scripts support YAML configuration:
+
+```bash
+# Use YAML config with basic.sh
+USE_YAML=true YAML_CONFIG=rtsp-client.yml RTSP_URL=rtsp://example.com/stream ./examples/basic.sh
+
+# Use YAML config with record_session.sh
+USE_YAML=true YAML_CONFIG=rtsp-client.yml DURATION=120 ./examples/record_session.sh
+```
+
 ## RTSP URL Format
 
 ### Standard Format
@@ -321,7 +433,7 @@ docker run -v /data/frames:/frames rtsp-client \
 
 ### Scripted Usage
 
-#### Bash Script Example
+#### Bash Script Example (Command-line Flags)
 ```bash
 #!/bin/bash
 
@@ -336,6 +448,28 @@ mkdir -p "$OUTPUT_DIR"
   -url "$RTSP_URL" \
   -output "$OUTPUT_DIR" \
   -verbose
+
+# Check exit code
+if [ $? -eq 0 ]; then
+  echo "RTSP client exited successfully"
+else
+  echo "RTSP client exited with error"
+  exit 1
+fi
+```
+
+#### Bash Script Example (YAML Configuration)
+```bash
+#!/bin/bash
+
+CONFIG_FILE="/etc/rtsp-client/camera1.yml"
+OUTPUT_DIR="/data/camera1/$(date +%Y%m%d)"
+
+# Create output directory
+mkdir -p "$OUTPUT_DIR"
+
+# Run client with YAML config, overriding output directory
+./bin/rtsp-client "$CONFIG_FILE" -output "$OUTPUT_DIR"
 
 # Check exit code
 if [ $? -eq 0 ]; then

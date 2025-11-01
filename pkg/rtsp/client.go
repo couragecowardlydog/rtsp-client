@@ -6,13 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/rtsp-client/pkg/logger"
 	"github.com/rtsp-client/pkg/rtp"
 )
 
@@ -26,6 +27,9 @@ var (
 	// ErrInvalidResponse indicates invalid RTSP response
 	ErrInvalidResponse = errors.New("invalid RTSP response")
 )
+
+// ClientRTCPHandler is called when an RTCP packet is received by the client
+type ClientRTCPHandler func(rtcpPacket rtp.RTCPPacket) error
 
 // Client represents an RTSP client
 type Client struct {
@@ -63,6 +67,8 @@ type Client struct {
 	sdpInfo             *SDPInfo
 	expectedPayloadType uint8
 	payloadTypeInit     bool
+	rtcpHandler         ClientRTCPHandler // Handler for RTCP packets
+	rtcpHandlerMu       sync.RWMutex
 }
 
 // SDPInfo captures parsed SDP metadata for aggregate and track-level details.
@@ -318,14 +324,35 @@ func (c *Client) ReadPacket() (*rtp.Packet, error) {
 					return nil, fmt.Errorf("failed to parse RTP packet: %w", err)
 				}
 				// Log RTP header details immediately after parsing
-				log.Printf("[RTP:ReadPacket:TCP] 📦 RTP Header: Version=%d, Padding=%t, Extension=%t, Marker=%t, PayloadType=%d, SeqNum=%d, Timestamp=%d, SSRC=0x%x, PayloadSize=%d bytes, Channel=%d",
+				logger.Debug("[RTP:ReadPacket:TCP] RTP Header: Version=%d, Padding=%t, Extension=%t, Marker=%t, PayloadType=%d, SeqNum=%d, Timestamp=%d, SSRC=0x%x, PayloadSize=%d bytes, Channel=%d",
 					packet.Version, packet.Padding, packet.Extension, packet.Marker, packet.PayloadType,
 					packet.SequenceNumber, packet.Timestamp, packet.SSRC, len(packet.Payload), channel)
 				c.validatePayloadType(packet)
 				return packet, nil
 			}
 
-			// Skip RTCP frames (odd channels)
+			// This is an RTCP channel (odd-numbered)
+			logger.Debug("[RTP:ReadPacket:TCP] RTCP packet detected on channel %d (size=%d bytes), routing to RTCP handler", channel, len(frame.Payload))
+			rtcpPacket, err := rtp.ParseRTCPPacket(frame.Payload)
+			if err != nil {
+				logger.Warn("[RTP:ReadPacket:TCP] Failed to parse RTCP packet: %v, continuing to look for RTP packet", err)
+				continue
+			}
+			
+			// Route RTCP packet to handler if registered
+			c.rtcpHandlerMu.RLock()
+			handler := c.rtcpHandler
+			c.rtcpHandlerMu.RUnlock()
+			
+			if handler != nil {
+				if err := handler(rtcpPacket); err != nil {
+					logger.Warn("[RTP:ReadPacket:TCP] RTCP handler error: %v", err)
+				}
+			} else {
+				logger.Debug("[RTP:ReadPacket:TCP] RTCP packet received but no handler registered (type=%d, SSRC=0x%x)", rtcpPacket.GetPacketType(), rtcpPacket.GetSSRC())
+			}
+			
+			// Continue to look for RTP packet
 			continue
 		}
 	}
@@ -350,13 +377,81 @@ func (c *Client) ReadPacket() (*rtp.Packet, error) {
 		return nil, fmt.Errorf("failed to parse RTP packet: %w", err)
 	}
 	// Log RTP header details immediately after parsing
-	log.Printf("[RTP:ReadPacket:UDP] 📦 RTP Header: Version=%d, Padding=%t, Extension=%t, Marker=%t, PayloadType=%d, SeqNum=%d, Timestamp=%d, SSRC=0x%x, PayloadSize=%d bytes",
+	logger.Debug("[RTP:ReadPacket:UDP] RTP Header: Version=%d, Padding=%t, Extension=%t, Marker=%t, PayloadType=%d, SeqNum=%d, Timestamp=%d, SSRC=0x%x, PayloadSize=%d bytes",
 		packet.Version, packet.Padding, packet.Extension, packet.Marker, packet.PayloadType,
 		packet.SequenceNumber, packet.Timestamp, packet.SSRC, len(packet.Payload))
 
 	c.validatePayloadType(packet)
 
 	return packet, nil
+}
+
+// SetRTCPHandler sets the handler function for RTCP packets
+// This allows RTCP packets to be processed automatically when ReadPacket() encounters them
+func (c *Client) SetRTCPHandler(handler ClientRTCPHandler) {
+	c.rtcpHandlerMu.Lock()
+	defer c.rtcpHandlerMu.Unlock()
+	c.rtcpHandler = handler
+	logger.Info("[Client] RTCP handler registered")
+}
+
+// ReadRTCP reads an RTCP packet from the stream
+// Returns the parsed RTCP packet or error
+func (c *Client) ReadRTCP() (rtp.RTCPPacket, error) {
+	if c.transportMode == TransportModeTCP {
+		if c.conn == nil {
+			return nil, fmt.Errorf("not connected")
+		}
+
+		if err := c.conn.SetReadDeadline(time.Now().Add(c.timeout)); err != nil {
+			return nil, err
+		}
+
+		for {
+			frame, err := c.ReadInterleavedPacket()
+			if err != nil {
+				return nil, err
+			}
+
+			channel := frame.Channel
+			// RTCP packets are on odd-numbered channels: 1, 3, 5, ...
+			if channel%2 == 1 {
+				// This is an RTCP channel
+				rtcpPacket, err := rtp.ParseRTCPPacket(frame.Payload)
+				if err != nil {
+					logger.Warn("[RTCP:ReadRTCP:TCP] Failed to parse RTCP packet: %v", err)
+					continue
+				}
+				return rtcpPacket, nil
+			}
+
+			// Skip RTP frames (even channels)
+			continue
+		}
+	}
+
+	// UDP mode
+	if c.rtcpConn == nil {
+		return nil, errors.New("RTCP connection not established")
+	}
+
+	buffer := make([]byte, 2048)
+	c.rtcpConn.SetReadDeadline(time.Now().Add(c.timeout))
+
+	n, err := c.rtcpConn.Read(buffer)
+	if err != nil {
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			return nil, err
+		}
+		return nil, err
+	}
+
+	rtcpPacket, err := rtp.ParseRTCPPacket(buffer[:n])
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse RTCP packet: %w", err)
+	}
+
+	return rtcpPacket, nil
 }
 
 // Teardown sends TEARDOWN request to stop streaming
@@ -543,12 +638,12 @@ func (c *Client) validatePayloadType(packet *rtp.Packet) {
 	if !c.payloadTypeInit {
 		c.expectedPayloadType = packet.PayloadType
 		c.payloadTypeInit = true
-		fmt.Printf("📺 Stream payload type: %d\n", packet.PayloadType)
+		logger.Info("[Client] Stream payload type: %d", packet.PayloadType)
 		return
 	}
 
 	if packet.PayloadType != c.expectedPayloadType {
-		fmt.Printf("⚠️  Payload type changed: %d → %d (codec may have changed)\n",
+		logger.Warn("[Client] Payload type changed: %d → %d (codec may have changed)",
 			c.expectedPayloadType, packet.PayloadType)
 		c.expectedPayloadType = packet.PayloadType
 	}

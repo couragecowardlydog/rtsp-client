@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/rtsp-client/pkg/logger"
 )
 
 var (
@@ -382,9 +384,37 @@ func (tm *TimestampMapper) UpdateFromSR(sr *SenderReport) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
+	oldInitialized := tm.initialized
+	oldRTP := tm.rtpTimestamp
+	oldNTP := tm.ntpTimestamp
+
 	tm.ntpTimestamp = sr.NTPTimestamp
 	tm.rtpTimestamp = sr.RTPTimestamp
 	tm.initialized = true
+	
+	logger.Debug("[TimestampMapper:UpdateFromSR] Mapping updated from RTCP Sender Report: RTP timestamp=%d, NTP timestamp=%d", sr.RTPTimestamp, sr.NTPTimestamp)
+	logger.Debug("[TimestampMapper:UpdateFromSR] Previous state: initialized=%t, RTP=%d, NTP=%d", oldInitialized, oldRTP, oldNTP)
+	logger.Debug("[TimestampMapper:UpdateFromSR] New state: initialized=%t, RTP=%d, NTP=%d", tm.initialized, tm.rtpTimestamp, tm.ntpTimestamp)
+}
+
+// MapperState represents the current state of the timestamp mapper
+type MapperState struct {
+	Initialized  bool
+	RTPTimestamp uint32
+	NTPTimestamp uint64
+	ClockRate    uint32
+}
+
+// GetState returns the current state of the timestamp mapper (for debugging)
+func (tm *TimestampMapper) GetState() MapperState {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return MapperState{
+		Initialized:  tm.initialized,
+		RTPTimestamp: tm.rtpTimestamp,
+		NTPTimestamp: tm.ntpTimestamp,
+		ClockRate:    tm.clockRate,
+	}
 }
 
 // RTPToNTP converts RTP timestamp to NTP timestamp

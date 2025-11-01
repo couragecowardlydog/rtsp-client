@@ -2,6 +2,7 @@
 #
 # Record a timed session from an RTSP stream
 # This script records for a specified duration and then converts frames to video
+# Supports both command-line flags and YAML configuration file
 #
 
 set -e
@@ -12,6 +13,8 @@ DURATION="${DURATION:-60}"  # Duration in seconds
 SESSION_NAME="${SESSION_NAME:-session_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="./recordings/$SESSION_NAME"
 VERBOSE="${VERBOSE:-false}"
+USE_YAML="${USE_YAML:-false}"  # Set to true to use YAML config file
+YAML_CONFIG="${YAML_CONFIG:-rtsp-client.yml}"  # Path to YAML config file
 
 # Colors
 GREEN='\033[0;32m'
@@ -49,16 +52,52 @@ mkdir -p "$OUTPUT_DIR"
 
 # Print configuration
 print_info "Recording Configuration:"
-echo "  RTSP URL: $RTSP_URL"
+if [ "$USE_YAML" = "true" ]; then
+    echo "  Config Mode: YAML file ($YAML_CONFIG)"
+    echo "  RTSP URL: $RTSP_URL (from YAML or override)"
+else
+    echo "  Config Mode: Command-line flags"
+    echo "  RTSP URL: $RTSP_URL"
+fi
 echo "  Duration: ${DURATION}s"
 echo "  Session: $SESSION_NAME"
 echo "  Output: $OUTPUT_DIR"
 echo ""
 
 # Build command
-CMD="./bin/rtsp-client -url $RTSP_URL -output $OUTPUT_DIR"
-if [ "$VERBOSE" = "true" ]; then
-    CMD="$CMD -verbose"
+if [ "$USE_YAML" = "true" ]; then
+    # Check if YAML config file exists
+    if [ ! -f "$YAML_CONFIG" ]; then
+        print_warn "YAML config file not found: $YAML_CONFIG"
+        print_info "Creating example YAML config from template..."
+        if [ -f "../rtsp-client.yml.example" ]; then
+            cp ../rtsp-client.yml.example "$YAML_CONFIG"
+            # Update RTSP URL in YAML file
+            sed -i.bak "s|rtsp_url:.*|rtsp_url: \"$RTSP_URL\"|" "$YAML_CONFIG" 2>/dev/null || \
+            sed -i '' "s|rtsp_url:.*|rtsp_url: \"$RTSP_URL\"|" "$YAML_CONFIG" 2>/dev/null || true
+            print_info "Created $YAML_CONFIG - please edit it with your settings"
+        else
+            print_error "YAML config template not found. Please create $YAML_CONFIG manually."
+            exit 1
+        fi
+    fi
+    
+    # Use YAML config file, but override output directory for this session
+    CMD="./bin/rtsp-client $YAML_CONFIG -output $OUTPUT_DIR"
+    
+    # Allow command-line flags to override YAML values
+    if [ "$VERBOSE" = "true" ]; then
+        CMD="$CMD -verbose"
+    fi
+    if [ -n "$RTSP_URL" ] && [ "$RTSP_URL" != "rtsp://192.168.1.100:554/stream" ]; then
+        CMD="$CMD -url $RTSP_URL"
+    fi
+else
+    # Use command-line flags
+    CMD="./bin/rtsp-client -url $RTSP_URL -output $OUTPUT_DIR"
+    if [ "$VERBOSE" = "true" ]; then
+        CMD="$CMD -verbose"
+    fi
 fi
 
 # Start recording

@@ -5,6 +5,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/rtsp-client/pkg/logger"
 	"github.com/rtsp-client/pkg/rtp"
 )
 
@@ -99,6 +100,9 @@ func (d *H264Decoder) ProcessPacket(packet *rtp.Packet) *Frame {
 		return nil
 	}
 
+	logger.Debug("[H264Decoder:ProcessPacket] Processing packet: seq=%d, timestamp=%d, marker=%t, payload=%d bytes", 
+		packet.SequenceNumber, packet.Timestamp, packet.Marker, len(packet.Payload))
+
 	// Initialize SSRC tracking on first packet
 	if !d.ssrcInitialized {
 		d.currentSSRC = packet.SSRC
@@ -107,7 +111,7 @@ func (d *H264Decoder) ProcessPacket(packet *rtp.Packet) *Frame {
 
 	// Detect SSRC change (stream changed or camera rebooted)
 	if packet.SSRC != d.currentSSRC {
-		fmt.Printf("⚠️  SSRC changed: 0x%x → 0x%x (stream changed or camera rebooted)\n",
+		logger.Warn("[H264Decoder] SSRC changed: 0x%x → 0x%x (stream changed or camera rebooted)",
 			d.currentSSRC, packet.SSRC)
 
 		// Reset decoder state for new stream
@@ -168,26 +172,37 @@ func (d *H264Decoder) ProcessPacket(packet *rtp.Packet) *Frame {
 
 	// Try to finalize old frames (check frames other than current)
 	var completedFrame *Frame
-	for ts, fa := range d.frameMap {
-		if ts != packet.Timestamp {
-			if d.shouldFinalizeFrame(fa) {
-				if frame := d.finalizeFrame(fa); frame != nil {
-					if ts == packet.Timestamp {
-						completedFrame = frame
-					} else {
+		for ts, fa := range d.frameMap {
+			if ts != packet.Timestamp {
+				if d.shouldFinalizeFrame(fa) {
+					logger.Debug("[H264Decoder:ProcessPacket] Old frame should be finalized: timestamp=%d, packets=%d, marker=%t", 
+						ts, len(fa.packets), fa.markerReceived)
+					if frame := d.finalizeFrame(fa); frame != nil {
+						logger.Debug("[H264Decoder:ProcessPacket] Old frame finalized: timestamp=%d, size=%d bytes", 
+							frame.Timestamp, len(frame.Data))
 						// Another frame completed, return it
 						delete(d.frameMap, ts)
 						return frame
+					} else {
+						logger.Warn("[H264Decoder:ProcessPacket] Old frame finalization returned nil: timestamp=%d", ts)
 					}
+					delete(d.frameMap, ts)
 				}
-				delete(d.frameMap, ts)
 			}
 		}
-	}
 
-	// Check if current frame should be finalized
-	if d.shouldFinalizeFrame(frameAssembly) {
-		completedFrame = d.finalizeFrame(frameAssembly)
+		// Check if current frame should be finalized
+		if d.shouldFinalizeFrame(frameAssembly) {
+			logger.Debug("[H264Decoder:ProcessPacket] Frame should be finalized: timestamp=%d, packets=%d, marker=%t", 
+				packet.Timestamp, len(frameAssembly.packets), frameAssembly.markerReceived)
+			completedFrame = d.finalizeFrame(frameAssembly)
+			if completedFrame != nil {
+				logger.Debug("[H264Decoder:ProcessPacket] Frame finalized: timestamp=%d, size=%d bytes, isKey=%t, corrupted=%t", 
+					completedFrame.Timestamp, len(completedFrame.Data), completedFrame.IsKey, completedFrame.IsCorrupted)
+			} else {
+				logger.Warn("[H264Decoder:ProcessPacket] Frame finalization returned nil: timestamp=%d, packets=%d", 
+					packet.Timestamp, len(frameAssembly.packets))
+			}
 		delete(d.frameMap, packet.Timestamp)
 		return completedFrame
 	}
@@ -420,8 +435,12 @@ func (d *H264Decoder) finalizeFrame(fa *FrameAssembly) *Frame {
 
 	// If frame has no data, return nil
 	if len(frameData) == 0 {
+		logger.Warn("[H264Decoder:finalizeFrame] Frame has no data: timestamp=%d, packets=%d", fa.timestamp, len(fa.packets))
 		return nil
 	}
+	
+	logger.Debug("[H264Decoder:finalizeFrame] Frame assembled: timestamp=%d, size=%d bytes, packets=%d, hasIDR=%t, corrupted=%t", 
+		fa.timestamp, len(frameData), len(fa.packets), hasIDR, isCorrupted)
 
 	// For IDR frames, prepend SPS/PPS if available
 	if hasIDR && len(d.spsNAL) > 0 && len(d.ppsNAL) > 0 {

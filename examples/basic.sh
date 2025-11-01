@@ -2,6 +2,7 @@
 #
 # Basic example of using RTSP client
 # This script demonstrates connecting to an RTSP stream and saving frames
+# Supports both command-line flags and YAML configuration file
 #
 
 set -e
@@ -11,6 +12,8 @@ RTSP_URL="${RTSP_URL:-rtsp://192.168.1.100:554/stream}"
 OUTPUT_DIR="${OUTPUT_DIR:-./frames}"
 TIMEOUT="${TIMEOUT:-10s}"
 VERBOSE="${VERBOSE:-false}"
+USE_YAML="${USE_YAML:-false}"  # Set to true to use YAML config file
+YAML_CONFIG="${YAML_CONFIG:-rtsp-client.yml}"  # Path to YAML config file
 
 # Colors for output
 RED='\033[0;31m'
@@ -49,18 +52,62 @@ if [ -z "$RTSP_URL" ]; then
 fi
 
 # Build command
-CMD="./bin/rtsp-client -url $RTSP_URL -output $OUTPUT_DIR -timeout $TIMEOUT"
+if [ "$USE_YAML" = "true" ]; then
+    # Check if YAML config file exists
+    if [ ! -f "$YAML_CONFIG" ]; then
+        print_warn "YAML config file not found: $YAML_CONFIG"
+        print_info "Creating example YAML config from template..."
+        if [ -f "../rtsp-client.yml.example" ]; then
+            cp ../rtsp-client.yml.example "$YAML_CONFIG"
+            # Update RTSP URL in YAML file
+            sed -i.bak "s|rtsp_url:.*|rtsp_url: \"$RTSP_URL\"|" "$YAML_CONFIG" 2>/dev/null || \
+            sed -i '' "s|rtsp_url:.*|rtsp_url: \"$RTSP_URL\"|" "$YAML_CONFIG" 2>/dev/null || true
+            print_info "Created $YAML_CONFIG - please edit it with your settings"
+        else
+            print_error "YAML config template not found. Please create $YAML_CONFIG manually."
+            exit 1
+        fi
+    fi
+    
+    # Use YAML config file
+    CMD="./bin/rtsp-client $YAML_CONFIG"
+    
+    # Allow command-line flags to override YAML values
+    if [ "$VERBOSE" = "true" ]; then
+        CMD="$CMD -verbose"
+    fi
+    if [ "$OUTPUT_DIR" != "./frames" ]; then
+        CMD="$CMD -output $OUTPUT_DIR"
+    fi
+    if [ "$TIMEOUT" != "10s" ]; then
+        CMD="$CMD -timeout $TIMEOUT"
+    fi
+    if [ -n "$RTSP_URL" ] && [ "$RTSP_URL" != "rtsp://192.168.1.100:554/stream" ]; then
+        CMD="$CMD -url $RTSP_URL"
+    fi
+else
+    # Use command-line flags
+    CMD="./bin/rtsp-client -url $RTSP_URL -output $OUTPUT_DIR -timeout $TIMEOUT"
 
-if [ "$VERBOSE" = "true" ]; then
-    CMD="$CMD -verbose"
+    if [ "$VERBOSE" = "true" ]; then
+        CMD="$CMD -verbose"
+    fi
 fi
 
 # Print configuration
 print_info "Configuration:"
-echo "  RTSP URL: $RTSP_URL"
+if [ "$USE_YAML" = "true" ]; then
+    echo "  Config Mode: YAML file ($YAML_CONFIG)"
+    echo "  RTSP URL: $RTSP_URL (from YAML or override)"
+else
+    echo "  Config Mode: Command-line flags"
+    echo "  RTSP URL: $RTSP_URL"
+fi
 echo "  Output Directory: $OUTPUT_DIR"
 echo "  Timeout: $TIMEOUT"
 echo "  Verbose: $VERBOSE"
+echo ""
+print_info "Tip: Set USE_YAML=true to use YAML configuration file"
 echo ""
 
 # Run client

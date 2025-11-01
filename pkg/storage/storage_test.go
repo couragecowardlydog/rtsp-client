@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/rtsp-client/pkg/decoder"
+	"github.com/rtsp-client/pkg/rtp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -110,8 +111,8 @@ func TestFrameStorage_SaveFrame(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 
-				// Verify file exists
-				filePath := filepath.Join(tempDir, tt.expectedFile)
+				// Verify file exists (files are saved in h264 subdirectory)
+				filePath := filepath.Join(tempDir, "h264", tt.expectedFile)
 				_, err := os.Stat(filePath)
 				require.NoError(t, err, "Frame file should exist")
 
@@ -252,7 +253,9 @@ func TestStorageStats_String(t *testing.T) {
 }
 
 func TestFrameStorage_getFilenameJPEG(t *testing.T) {
-	storage := &FrameStorage{}
+	storage := &FrameStorage{
+		timestampMapper: rtp.NewTimestampMapper(),
+	}
 
 	tests := []struct {
 		name      string

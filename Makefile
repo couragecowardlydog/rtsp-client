@@ -1,4 +1,4 @@
-.PHONY: all build test test-coverage test-integration clean run help install
+.PHONY: all build test test-coverage test-integration test-realworld clean run help install
 
 # Variables
 BINARY_NAME=rtsp-client
@@ -38,6 +38,18 @@ test-integration:
 		exit 1; \
 	fi
 	$(GO) test -v -tags=integration ./test/...
+
+# Run real-world tests with MediaMTX and ffmpeg (requires Docker, ffmpeg, and sample.mp4)
+test-realworld:
+	@echo "Running real-world tests with MediaMTX and ffmpeg..."
+	@echo "Requirements: Docker, ffmpeg, and sample.mp4 in project root"
+	@echo ""
+	@which docker > /dev/null || (echo "Error: docker not found. Please install Docker." && exit 1)
+	@which ffmpeg > /dev/null || (echo "Error: ffmpeg not found. Please install ffmpeg." && exit 1)
+	@if [ ! -f sample.mp4 ]; then \
+		echo "Warning: sample.mp4 not found in project root. Tests will be skipped."; \
+	fi
+	$(GO) test -v -timeout 5m ./test -run TestRealWorld
 
 # Clean build artifacts
 clean:
@@ -107,6 +119,7 @@ help:
 	@echo "  make test              - Run unit tests"
 	@echo "  make test-coverage     - Run tests with coverage report"
 	@echo "  make test-integration  - Run integration tests (requires RTSP_URL)"
+	@echo "  make test-realworld    - Run real-world tests with MediaMTX/ffmpeg (requires Docker, ffmpeg, sample.mp4)"
 	@echo "  make clean             - Clean build artifacts"
 	@echo "  make run               - Build and run (requires RTSP_URL)"
 	@echo "  make install           - Install to \$$GOPATH/bin"

@@ -36,6 +36,37 @@
 RTSP_URL=rtsp://127.0.0.1:8554/mystream make run
 ```
 
+#### Method 3: Using YAML Configuration File
+
+You can use a YAML configuration file (similar to mediamtx) for easier configuration management:
+
+1. **Create a configuration file** from the example:
+   ```bash
+   cp rtsp-client.yml.example rtsp-client.yml
+   ```
+
+2. **Edit the configuration file** with your settings:
+   ```yaml
+   rtsp_url: "rtsp://127.0.0.1:8554/mystream"
+   output_dir: "./frames"
+   timeout: "10s"
+   verbose: false
+   save_jpeg: true
+   continuous_decoder: true
+   ```
+
+3. **Run with the YAML file**:
+   ```bash
+   ./bin/rtsp-client rtsp-client.yml
+   ```
+
+4. **Override YAML values with command-line flags**:
+   ```bash
+   ./bin/rtsp-client rtsp-client.yml -verbose -output ./custom_frames
+   ```
+
+The priority order is: **Defaults < YAML < Command-line flags**
+
 ### Common Options
 
 #### Basic Start (H.264 files only)
@@ -119,6 +150,18 @@ RTSP_URL=rtsp://127.0.0.1:8554/mystream make run
   -output ./frames \
   -jpeg \
   -continuous-decoder=false
+```
+
+#### Example 5: Using YAML Configuration
+```bash
+# Create config file
+cp rtsp-client.yml.example rtsp-client.yml
+
+# Edit rtsp-client.yml with your settings, then run:
+./bin/rtsp-client rtsp-client.yml
+
+# Override YAML settings with flags:
+./bin/rtsp-client rtsp-client.yml -verbose
 ```
 
 ### Running in Background

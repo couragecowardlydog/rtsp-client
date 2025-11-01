@@ -6,13 +6,24 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/rtsp-client/pkg/decoder"
+	"github.com/rtsp-client/pkg/logger"
+	"github.com/rtsp-client/pkg/rtp"
+)
+
+const (
+	// MetadataQueueSize10MB is the queue size for 10 MB buffer
+	// FrameWithTimestamp is approximately 32 bytes (pointer + uint32 + int64 + padding)
+	// 10 MB = 10 * 1024 * 1024 bytes = 10,485,760 bytes
+	// 10,485,760 / 32 ≈ 327,680 items
+	// Using 300,000 for safety margin
+	MetadataQueueSize10MB = 300000
 )
 
 var (
@@ -58,6 +69,9 @@ type ContinuousDecoder struct {
 	spsNAL          []byte
 	ppsNAL          []byte
 	
+	// Timestamp conversion function (RTP timestamp -> Unix epoch nanoseconds)
+	timestampConverter func(uint32) int64
+	
 	// Statistics
 	decodedCount    int64
 	failedCount     int64
@@ -73,38 +87,40 @@ type DecodedFrame struct {
 }
 
 // NewContinuousDecoder creates a new continuous decoder session
-func NewContinuousDecoder(ffmpegPath, jpegDir, corruptedJpegDir string, spsNAL, ppsNAL []byte) (*ContinuousDecoder, error) {
-	log.Printf("[ContinuousDecoder] Initializing continuous decoder session")
-	log.Printf("[ContinuousDecoder] Configuration: jpegDir=%s, corruptedJpegDir=%s", jpegDir, corruptedJpegDir)
-	log.Printf("[ContinuousDecoder] SPS size: %d bytes, PPS size: %d bytes", len(spsNAL), len(ppsNAL))
+// timestampConverter: function to convert RTP timestamp to Unix epoch nanoseconds (can be nil)
+func NewContinuousDecoder(ffmpegPath, jpegDir, corruptedJpegDir string, spsNAL, ppsNAL []byte, timestampConverter func(uint32) int64) (*ContinuousDecoder, error) {
+	logger.Info("[ContinuousDecoder] Initializing continuous decoder session")
+	logger.Debug("[ContinuousDecoder] Configuration: jpegDir=%s, corruptedJpegDir=%s", jpegDir, corruptedJpegDir)
+	logger.Debug("[ContinuousDecoder] SPS size: %d bytes, PPS size: %d bytes", len(spsNAL), len(ppsNAL))
 	
 	cd := &ContinuousDecoder{
-		ffmpegPath:      ffmpegPath,
-		jpegDir:         jpegDir,
-		corruptedJpegDir: corruptedJpegDir,
-		spsNAL:          spsNAL,
-		ppsNAL:          ppsNAL,
-		frameQueue:      make(chan FrameWithTimestamp, 100), // Buffer up to 100 frames
-		decodedQueue:    make(chan DecodedFrame, 100),
-		metadataQueue:   make(chan FrameWithTimestamp, 100), // Frame metadata for matching
-		initialized:     false,
+		ffmpegPath:        ffmpegPath,
+		jpegDir:           jpegDir,
+		corruptedJpegDir:  corruptedJpegDir,
+		spsNAL:            spsNAL,
+		ppsNAL:            ppsNAL,
+		frameQueue:        make(chan FrameWithTimestamp, 100), // Buffer up to 100 frames
+		decodedQueue:      make(chan DecodedFrame, 100),
+		metadataQueue:     make(chan FrameWithTimestamp, MetadataQueueSize10MB), // Frame metadata for matching (10 MB buffer)
+		timestampConverter: timestampConverter,
+		initialized:       false,
 	}
 	
-	log.Printf("[ContinuousDecoder] Starting FFmpeg process...")
+	logger.Info("[ContinuousDecoder] Starting FFmpeg process...")
 	if err := cd.start(); err != nil {
-		log.Printf("[ContinuousDecoder] ❌ Failed to start: %v", err)
+		logger.Error("[ContinuousDecoder] Failed to start: %v", err)
 		return nil, fmt.Errorf("failed to start continuous decoder: %w", err)
 	}
 	
-	log.Printf("[ContinuousDecoder] ✅ FFmpeg process started successfully")
-	log.Printf("[ContinuousDecoder] Starting goroutines: feedFrames, receiveFrames, saveDecodedFrames")
+	logger.Info("[ContinuousDecoder] FFmpeg process started successfully")
+	logger.Debug("[ContinuousDecoder] Starting goroutines: feedFrames, receiveFrames, saveDecodedFrames")
 	
 	// Start goroutines for processing
 	go cd.feedFrames()
 	go cd.receiveFrames()
 	go cd.saveDecodedFrames()
 	
-	log.Printf("[ContinuousDecoder] ✅ Continuous decoder fully initialized and ready")
+	logger.Info("[ContinuousDecoder] Continuous decoder fully initialized and ready")
 	
 	return cd, nil
 }
@@ -169,29 +185,29 @@ func (cd *ContinuousDecoder) start() error {
 	
 	// Write SPS/PPS to initialize decoder
 	if len(cd.spsNAL) > 0 && len(cd.ppsNAL) > 0 {
-		log.Printf("[ContinuousDecoder] Writing SPS (%d bytes) and PPS (%d bytes) to initialize decoder", len(cd.spsNAL), len(cd.ppsNAL))
+		logger.Debug("[ContinuousDecoder] Writing SPS (%d bytes) and PPS (%d bytes) to initialize decoder", len(cd.spsNAL), len(cd.ppsNAL))
 		if _, err := cd.stdin.Write(cd.spsNAL); err != nil {
-			log.Printf("[ContinuousDecoder] ❌ Failed to write SPS: %v", err)
+			logger.Error("[ContinuousDecoder] Failed to write SPS: %v", err)
 			return fmt.Errorf("failed to write SPS: %w", err)
 		}
 		if _, err := cd.stdin.Write(cd.ppsNAL); err != nil {
-			log.Printf("[ContinuousDecoder] ❌ Failed to write PPS: %v", err)
+			logger.Error("[ContinuousDecoder] Failed to write PPS: %v", err)
 			return fmt.Errorf("failed to write PPS: %w", err)
 		}
 		cd.initialized = true
-		log.Printf("[ContinuousDecoder] ✅ SPS/PPS written, decoder initialized")
+		logger.Info("[ContinuousDecoder] SPS/PPS written, decoder initialized")
 	} else {
-		log.Printf("[ContinuousDecoder] ⚠️  No SPS/PPS provided, decoder may not work correctly")
+		logger.Warn("[ContinuousDecoder] No SPS/PPS provided, decoder may not work correctly")
 	}
 	
-	log.Printf("[ContinuousDecoder] FFmpeg process ready, PID: %d", cd.cmd.Process.Pid)
+	logger.Debug("[ContinuousDecoder] FFmpeg process ready, PID: %d", cd.cmd.Process.Pid)
 	return nil
 }
 
 // FeedFrame feeds a frame to the continuous decoder
 func (cd *ContinuousDecoder) FeedFrame(frame *decoder.Frame) {
 	if !cd.running {
-		log.Printf("[ContinuousDecoder] ⚠️  FeedFrame called but decoder not running, dropping frame (timestamp: %d)", frame.Timestamp)
+		logger.Warn("[ContinuousDecoder] FeedFrame called but decoder not running, dropping frame (timestamp: %d)", frame.Timestamp)
 		return
 	}
 	
@@ -201,7 +217,7 @@ func (cd *ContinuousDecoder) FeedFrame(frame *decoder.Frame) {
 	frameQueueLen := len(cd.frameQueue)
 	cd.mu.Unlock()
 	
-	log.Printf("[ContinuousDecoder] 📥 Feeding frame: seq=%d, timestamp=%d, size=%d bytes, isKey=%t, corrupted=%t, queueLen=%d",
+	logger.Debug("[ContinuousDecoder] Feeding frame: seq=%d, timestamp=%d, size=%d bytes, isKey=%t, corrupted=%t, queueLen=%d",
 		seqNum, frame.Timestamp, len(frame.Data), frame.IsKey, frame.IsCorrupted, frameQueueLen)
 	
 	select {
@@ -213,14 +229,14 @@ func (cd *ContinuousDecoder) FeedFrame(frame *decoder.Frame) {
 		// Frame queued successfully
 	default:
 		// Queue full, drop frame (non-blocking)
-		log.Printf("[ContinuousDecoder] ⚠️  Frame queue full (%d/100), dropping frame (seq=%d, timestamp=%d)",
+		logger.Warn("[ContinuousDecoder] Frame queue full (%d/100), dropping frame (seq=%d, timestamp=%d)",
 			frameQueueLen, seqNum, frame.Timestamp)
 	}
 }
 
 // receiveFrames continuously receives decoded JPEG frames from FFmpeg stdout
 func (cd *ContinuousDecoder) receiveFrames() {
-	log.Printf("[ContinuousDecoder:receiveFrames] 🟢 Goroutine started")
+	logger.Debug("[ContinuousDecoder:receiveFrames] Goroutine started")
 	buffer := make([]byte, 4096)
 	jpegBuffer := make([]byte, 0, 1024*1024) // 1MB initial capacity
 	jpegFrameCount := 0
@@ -228,7 +244,7 @@ func (cd *ContinuousDecoder) receiveFrames() {
 	
 	for {
 		if !cd.running {
-			log.Printf("[ContinuousDecoder:receiveFrames] 🔴 Decoder stopped, exiting receiveFrames goroutine")
+			logger.Debug("[ContinuousDecoder:receiveFrames] Decoder stopped, exiting receiveFrames goroutine")
 			return
 		}
 		
@@ -237,23 +253,23 @@ func (cd *ContinuousDecoder) receiveFrames() {
 		cd.mu.Unlock()
 		
 		if stdout == nil {
-			log.Printf("[ContinuousDecoder:receiveFrames] ⚠️  Stdout is nil, exiting")
+			logger.Warn("[ContinuousDecoder:receiveFrames] Stdout is nil, exiting")
 			return
 		}
 		
 		n, err := stdout.Read(buffer)
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("[ContinuousDecoder:receiveFrames] ❌ Error reading from decoder stdout: %v", err)
+				logger.Error("[ContinuousDecoder:receiveFrames] Error reading from decoder stdout: %v", err)
 			} else {
-				log.Printf("[ContinuousDecoder:receiveFrames] 📄 EOF reached on stdout (read %d times, decoded %d frames)", readCount, jpegFrameCount)
+				logger.Debug("[ContinuousDecoder:receiveFrames] EOF reached on stdout (read %d times, decoded %d frames)", readCount, jpegFrameCount)
 			}
 			break
 		}
 		
 		readCount++
 		if readCount%100 == 0 {
-			log.Printf("[ContinuousDecoder:receiveFrames] 📊 Read progress: %d reads, buffer size: %d bytes, decoded frames: %d",
+			logger.Debug("[ContinuousDecoder:receiveFrames] Read progress: %d reads, buffer size: %d bytes, decoded frames: %d",
 				readCount, len(jpegBuffer), jpegFrameCount)
 		}
 		
@@ -269,7 +285,7 @@ func (cd *ContinuousDecoder) receiveFrames() {
 			endIdx := findJPEGEnd(jpegBuffer[startIdx:])
 			if endIdx == -1 {
 				// Incomplete JPEG, keep buffering
-				log.Printf("[ContinuousDecoder:receiveFrames] ⏳ Incomplete JPEG frame detected at offset %d, buffering...", startIdx)
+				logger.Debug("[ContinuousDecoder:receiveFrames] Incomplete JPEG frame detected at offset %d, buffering...", startIdx)
 				break
 			}
 			
@@ -278,7 +294,7 @@ func (cd *ContinuousDecoder) receiveFrames() {
 			copy(jpegFrame, jpegBuffer[startIdx:startIdx+endIdx])
 			jpegFrameCount++
 			
-			log.Printf("[ContinuousDecoder:receiveFrames] 🖼️  Complete JPEG frame #%d found: %d bytes (startIdx=%d, endIdx=%d)",
+			logger.Debug("[ContinuousDecoder:receiveFrames] Complete JPEG frame #%d found: %d bytes (startIdx=%d, endIdx=%d)",
 				jpegFrameCount, len(jpegFrame), startIdx, endIdx)
 			
 			// Remove processed data from buffer
@@ -291,7 +307,7 @@ func (cd *ContinuousDecoder) receiveFrames() {
 			cd.mu.Unlock()
 			
 			decodedQueueLen := len(cd.decodedQueue)
-			log.Printf("[ContinuousDecoder:receiveFrames] 📤 Sending decoded frame to queue: size=%d bytes, decodedCount=%d, queueLen=%d/100",
+			logger.Debug("[ContinuousDecoder:receiveFrames] Sending decoded frame to queue: size=%d bytes, decodedCount=%d, queueLen=%d/100",
 				len(jpegFrame), decodedCount, decodedQueueLen)
 			
 			// Send decoded frame for saving (will be matched with metadata in saveDecodedFrames)
@@ -299,21 +315,21 @@ func (cd *ContinuousDecoder) receiveFrames() {
 			case cd.decodedQueue <- DecodedFrame{
 				JPEGData: jpegFrame,
 			}:
-				log.Printf("[ContinuousDecoder:receiveFrames] ✅ Decoded frame queued successfully (#%d)", jpegFrameCount)
+				logger.Debug("[ContinuousDecoder:receiveFrames] Decoded frame queued successfully (#%d)", jpegFrameCount)
 			default:
-				log.Printf("[ContinuousDecoder:receiveFrames] ⚠️  Decoded frame queue full (%d/100), dropping frame #%d",
+				logger.Warn("[ContinuousDecoder:receiveFrames] Decoded frame queue full (%d/100), dropping frame #%d",
 					decodedQueueLen, jpegFrameCount)
 			}
 		}
 	}
 	
-	log.Printf("[ContinuousDecoder:receiveFrames] 🔴 Exiting (total: %d reads, %d JPEG frames decoded, buffer: %d bytes)",
+	logger.Debug("[ContinuousDecoder:receiveFrames] Exiting (total: %d reads, %d JPEG frames decoded, buffer: %d bytes)",
 		readCount, jpegFrameCount, len(jpegBuffer))
 }
 
 // saveDecodedFrames saves decoded JPEG frames to disk
 func (cd *ContinuousDecoder) saveDecodedFrames() {
-	log.Printf("[ContinuousDecoder:saveDecodedFrames] 🟢 Goroutine started")
+	logger.Debug("[ContinuousDecoder:saveDecodedFrames] Goroutine started")
 	savedCount := 0
 	metadataMatchCount := 0
 	metadataMissCount := 0
@@ -321,7 +337,7 @@ func (cd *ContinuousDecoder) saveDecodedFrames() {
 	for decodedFrame := range cd.decodedQueue {
 		savedCount++
 		
-		log.Printf("[ContinuousDecoder:saveDecodedFrames] 💾 Processing decoded frame #%d: size=%d bytes",
+		logger.Debug("[ContinuousDecoder:saveDecodedFrames] Processing decoded frame #%d: size=%d bytes",
 			savedCount, len(decodedFrame.JPEGData))
 		
 		// Get matching frame metadata from queue (FIFO, sequential matching)
@@ -331,7 +347,7 @@ func (cd *ContinuousDecoder) saveDecodedFrames() {
 		select {
 		case frameData = <-cd.metadataQueue:
 			metadataMatchCount++
-			log.Printf("[ContinuousDecoder:saveDecodedFrames] ✅ Metadata matched: timestamp=%d, seq=%d (matchCount=%d, queueLen=%d->%d)",
+			logger.Debug("[ContinuousDecoder:saveDecodedFrames] Metadata matched: timestamp=%d, seq=%d (matchCount=%d, queueLen=%d->%d)",
 				frameData.Timestamp, frameData.SeqNumber, metadataMatchCount, metadataQueueLen, len(cd.metadataQueue))
 		default:
 			metadataMissCount++
@@ -339,7 +355,7 @@ func (cd *ContinuousDecoder) saveDecodedFrames() {
 			frameData = FrameWithTimestamp{
 				Timestamp: uint32(savedCount), // Fallback to sequential number
 			}
-			log.Printf("[ContinuousDecoder:saveDecodedFrames] ⚠️  No metadata available, using fallback timestamp=%d (missCount=%d, queueLen=%d)",
+			logger.Warn("[ContinuousDecoder:saveDecodedFrames] No metadata available, using fallback timestamp=%d (missCount=%d, queueLen=%d)",
 				frameData.Timestamp, metadataMissCount, metadataQueueLen)
 		}
 		
@@ -347,7 +363,7 @@ func (cd *ContinuousDecoder) saveDecodedFrames() {
 		decodedFrame.IsCorrupted = frameData.Frame != nil && frameData.Frame.IsCorrupted
 		
 		if frameData.Frame != nil {
-			log.Printf("[ContinuousDecoder:saveDecodedFrames] Frame info: timestamp=%d, isKey=%t, corrupted=%t",
+			logger.Debug("[ContinuousDecoder:saveDecodedFrames] Frame info: timestamp=%d, isKey=%t, corrupted=%t",
 				decodedFrame.Timestamp, frameData.Frame.IsKey, decodedFrame.IsCorrupted)
 		}
 		
@@ -355,19 +371,51 @@ func (cd *ContinuousDecoder) saveDecodedFrames() {
 		var targetDir string
 		if decodedFrame.IsCorrupted {
 			targetDir = cd.corruptedJpegDir
-			log.Printf("[ContinuousDecoder:saveDecodedFrames] ⚠️  Frame is corrupted, saving to corrupted JPEG directory")
+			logger.Warn("[ContinuousDecoder:saveDecodedFrames] Frame is corrupted, saving to corrupted JPEG directory")
 		} else {
 			targetDir = cd.jpegDir
 		}
 		
-		// Save JPEG file
-		jpgPath := filepath.Join(targetDir, fmt.Sprintf("%d.jpg", decodedFrame.Timestamp))
-		log.Printf("[ContinuousDecoder:saveDecodedFrames] 💾 Saving JPEG: path=%s, size=%d bytes", jpgPath, len(decodedFrame.JPEGData))
+		// Save JPEG file with NTP timestamp in nanoseconds and RTP timestamp
+		// Format: NTPNANOSECONDS.RTPTIMESTAMP.jpg (e.g., 1761897425257387428.1234567890.jpg)
+		// This preserves both NTP (wall-clock) time and RTP timestamp for correlation
+		var jpgPath string
+		var namingFormat string
+		if cd.timestampConverter != nil {
+			unixNanos := cd.timestampConverter(decodedFrame.Timestamp)
+			if unixNanos != 0 {
+				// Format: ntpinnanoseconds.rtptimestamp.jpg
+				// This preserves full nanosecond precision from RTCP NTP timestamps and RTP timestamp
+				if decodedFrame.IsCorrupted {
+					jpgPath = filepath.Join(targetDir, fmt.Sprintf("%d.%d_corrupted.jpg", unixNanos, decodedFrame.Timestamp))
+				} else {
+					jpgPath = filepath.Join(targetDir, fmt.Sprintf("%d.%d.jpg", unixNanos, decodedFrame.Timestamp))
+				}
+				namingFormat = fmt.Sprintf("NTP (nanoseconds).RTP timestamp: %d.%d", unixNanos, decodedFrame.Timestamp)
+			} else {
+				// Fallback to RTP timestamp if mapping not available yet
+				if decodedFrame.IsCorrupted {
+					jpgPath = filepath.Join(targetDir, fmt.Sprintf("%d_corrupted.jpg", decodedFrame.Timestamp))
+				} else {
+					jpgPath = filepath.Join(targetDir, fmt.Sprintf("%d.jpg", decodedFrame.Timestamp))
+				}
+				namingFormat = fmt.Sprintf("RTP timestamp (mapping not available): %d", decodedFrame.Timestamp)
+			}
+		} else {
+			// No converter provided, use RTP timestamp
+			if decodedFrame.IsCorrupted {
+				jpgPath = filepath.Join(targetDir, fmt.Sprintf("%d_corrupted.jpg", decodedFrame.Timestamp))
+			} else {
+				jpgPath = filepath.Join(targetDir, fmt.Sprintf("%d.jpg", decodedFrame.Timestamp))
+			}
+			namingFormat = fmt.Sprintf("RTP timestamp (no converter): %d", decodedFrame.Timestamp)
+		}
+		logger.Debug("[ContinuousDecoder:saveDecodedFrames] Saving JPEG: path=%s, size=%d bytes, naming=%s", jpgPath, len(decodedFrame.JPEGData), namingFormat)
 		
 		if err := os.WriteFile(jpgPath, decodedFrame.JPEGData, 0644); err != nil {
-			log.Printf("[ContinuousDecoder:saveDecodedFrames] ❌ Failed to save decoded frame #%d: %v", savedCount, err)
+			logger.Error("[ContinuousDecoder:saveDecodedFrames] Failed to save decoded frame #%d: %v", savedCount, err)
 		} else {
-			log.Printf("[ContinuousDecoder:saveDecodedFrames] ✅ Successfully saved frame #%d: %s (%d bytes)",
+			logger.Debug("[ContinuousDecoder:saveDecodedFrames] Successfully saved frame #%d: %s (%d bytes)",
 				savedCount, jpgPath, len(decodedFrame.JPEGData))
 		}
 		
@@ -377,34 +425,34 @@ func (cd *ContinuousDecoder) saveDecodedFrames() {
 			decodedCount := cd.decodedCount
 			failedCount := cd.failedCount
 			cd.mu.Unlock()
-			log.Printf("[ContinuousDecoder:saveDecodedFrames] 📊 Statistics: saved=%d, decoded=%d, failed=%d, metadataMatches=%d, metadataMisses=%d",
+			logger.Debug("[ContinuousDecoder:saveDecodedFrames] Statistics: saved=%d, decoded=%d, failed=%d, metadataMatches=%d, metadataMisses=%d",
 				savedCount, decodedCount, failedCount, metadataMatchCount, metadataMissCount)
 		}
 	}
 	
-	log.Printf("[ContinuousDecoder:saveDecodedFrames] 🔴 Decoded queue closed, exiting (total saved: %d, matches: %d, misses: %d)",
+	logger.Debug("[ContinuousDecoder:saveDecodedFrames] Decoded queue closed, exiting (total saved: %d, matches: %d, misses: %d)",
 		savedCount, metadataMatchCount, metadataMissCount)
 }
 
 // feedFrames continuously feeds frames to FFmpeg stdin
 func (cd *ContinuousDecoder) feedFrames() {
-	log.Printf("[ContinuousDecoder:feedFrames] 🟢 Goroutine started")
+	logger.Debug("[ContinuousDecoder:feedFrames] Goroutine started")
 	frameCount := 0
 	
 	for frameData := range cd.frameQueue {
 		frameCount++
 		
 		if !cd.running {
-			log.Printf("[ContinuousDecoder:feedFrames] 🔴 Decoder stopped, exiting feedFrames goroutine (processed %d frames)", frameCount)
+			logger.Debug("[ContinuousDecoder:feedFrames] Decoder stopped, exiting feedFrames goroutine (processed %d frames)", frameCount)
 			return
 		}
 		
-		log.Printf("[ContinuousDecoder:feedFrames] Processing frame seq=%d, timestamp=%d, size=%d bytes",
+		logger.Debug("[ContinuousDecoder:feedFrames] Processing frame seq=%d, timestamp=%d, size=%d bytes",
 			frameData.SeqNumber, frameData.Timestamp, len(frameData.Frame.Data))
 		
 		// Skip corrupted frames to avoid decoder errors
 		if frameData.Frame.IsCorrupted {
-			log.Printf("[ContinuousDecoder:feedFrames] ⏭️  Skipping corrupted frame seq=%d, timestamp=%d",
+			logger.Debug("[ContinuousDecoder:feedFrames] Skipping corrupted frame seq=%d, timestamp=%d",
 				frameData.SeqNumber, frameData.Timestamp)
 			continue
 		}
@@ -413,11 +461,11 @@ func (cd *ContinuousDecoder) feedFrames() {
 		metadataQueueLen := len(cd.metadataQueue)
 		select {
 		case cd.metadataQueue <- frameData:
-			log.Printf("[ContinuousDecoder:feedFrames] ✅ Metadata queued: seq=%d, timestamp=%d (metadataQueue: %d/100)",
-				frameData.SeqNumber, frameData.Timestamp, metadataQueueLen+1)
+			logger.Debug("[ContinuousDecoder:feedFrames] Metadata queued: seq=%d, timestamp=%d (metadataQueue: %d/%d)",
+				frameData.SeqNumber, frameData.Timestamp, metadataQueueLen+1, MetadataQueueSize10MB)
 		default:
-			log.Printf("[ContinuousDecoder:feedFrames] ⚠️  Metadata queue full (%d/100), skipping metadata for seq=%d",
-				metadataQueueLen, frameData.SeqNumber)
+			logger.Warn("[ContinuousDecoder:feedFrames] Metadata queue full (%d/%d), skipping metadata for seq=%d",
+				metadataQueueLen, MetadataQueueSize10MB, frameData.SeqNumber)
 		}
 		
 		cd.mu.Lock()
@@ -425,35 +473,35 @@ func (cd *ContinuousDecoder) feedFrames() {
 		cd.mu.Unlock()
 		
 		if stdin == nil {
-			log.Printf("[ContinuousDecoder:feedFrames] ⚠️  Stdin is nil, skipping frame seq=%d", frameData.SeqNumber)
+			logger.Warn("[ContinuousDecoder:feedFrames] Stdin is nil, skipping frame seq=%d", frameData.SeqNumber)
 			continue
 		}
 		
 		// Write frame data to FFmpeg stdin
 		bytesWritten, err := stdin.Write(frameData.Frame.Data)
 		if err != nil {
-			log.Printf("[ContinuousDecoder:feedFrames] ❌ Failed to write frame to FFmpeg stdin: seq=%d, bytes=%d/%d, error=%v",
+			logger.Error("[ContinuousDecoder:feedFrames] Failed to write frame to FFmpeg stdin: seq=%d, bytes=%d/%d, error=%v",
 				frameData.SeqNumber, bytesWritten, len(frameData.Frame.Data), err)
 			cd.mu.Lock()
 			cd.failedCount++
 			failedCount := cd.failedCount
 			cd.mu.Unlock()
-			log.Printf("[ContinuousDecoder:feedFrames] Failed frame count: %d", failedCount)
+			logger.Debug("[ContinuousDecoder:feedFrames] Failed frame count: %d", failedCount)
 			continue
 		}
 		
-		log.Printf("[ContinuousDecoder:feedFrames] ✅ Wrote frame to FFmpeg: seq=%d, timestamp=%d, bytes=%d/%d",
+		logger.Debug("[ContinuousDecoder:feedFrames] Wrote frame to FFmpeg: seq=%d, timestamp=%d, bytes=%d/%d",
 			frameData.SeqNumber, frameData.Timestamp, bytesWritten, len(frameData.Frame.Data))
 		
 		// Flush to ensure frame is sent
 		if flusher, ok := stdin.(interface{ Flush() error }); ok {
 			if err := flusher.Flush(); err != nil {
-				log.Printf("[ContinuousDecoder:feedFrames] ⚠️  Flush error: %v", err)
+				logger.Warn("[ContinuousDecoder:feedFrames] Flush error: %v", err)
 			}
 		}
 	}
 	
-	log.Printf("[ContinuousDecoder:feedFrames] 🔴 Frame queue closed, exiting (total frames processed: %d)", frameCount)
+	logger.Debug("[ContinuousDecoder:feedFrames] Frame queue closed, exiting (total frames processed: %d)", frameCount)
 }
 
 // findJPEGStart finds the start of a JPEG frame (0xFF 0xD8)
@@ -482,43 +530,43 @@ func (cd *ContinuousDecoder) Stop() error {
 	
 	if !cd.running {
 		cd.mu.Unlock()
-		log.Printf("[ContinuousDecoder] ⚠️  Stop called but decoder not running")
+		logger.Warn("[ContinuousDecoder] Stop called but decoder not running")
 		return nil
 	}
 	
-	log.Printf("[ContinuousDecoder] 🛑 Stopping continuous decoder...")
-	log.Printf("[ContinuousDecoder] Queue states: frameQueue=%d, decodedQueue=%d, metadataQueue=%d",
+	logger.Debug("[ContinuousDecoder] Stopping continuous decoder...")
+	logger.Debug("[ContinuousDecoder] Queue states: frameQueue=%d, decodedQueue=%d, metadataQueue=%d",
 		len(cd.frameQueue), len(cd.decodedQueue), len(cd.metadataQueue))
 	
 	cd.running = false
 	cd.mu.Unlock()
 	
 	// Close queues
-	log.Printf("[ContinuousDecoder] Closing queues...")
+	logger.Debug("[ContinuousDecoder] Closing queues...")
 	close(cd.frameQueue)
 	close(cd.decodedQueue)
 	close(cd.metadataQueue)
 	
 	// Close stdin to signal end of input
 	if cd.stdin != nil {
-		log.Printf("[ContinuousDecoder] Closing stdin pipe...")
+		logger.Debug("[ContinuousDecoder] Closing stdin pipe...")
 		if err := cd.stdin.Close(); err != nil {
-			log.Printf("[ContinuousDecoder] ⚠️  Error closing stdin: %v", err)
+			logger.Warn("[ContinuousDecoder] Error closing stdin: %v", err)
 		}
 	}
 	
 	// Wait for process to finish
 	if cd.cmd != nil {
-		log.Printf("[ContinuousDecoder] Waiting for FFmpeg process to finish (PID: %d)...", cd.cmd.Process.Pid)
+		logger.Debug("[ContinuousDecoder] Waiting for FFmpeg process to finish (PID: %d)...", cd.cmd.Process.Pid)
 		if err := cd.cmd.Wait(); err != nil {
 			cd.mu.Lock()
 			decodedCount := cd.decodedCount
 			failedCount := cd.failedCount
 			cd.mu.Unlock()
-			log.Printf("[ContinuousDecoder] ⚠️  FFmpeg process error: %v (decoded: %d, failed: %d)", err, decodedCount, failedCount)
+			logger.Warn("[ContinuousDecoder] FFmpeg process error: %v (decoded: %d, failed: %d)", err, decodedCount, failedCount)
 			return fmt.Errorf("ffmpeg process error: %w", err)
 		}
-		log.Printf("[ContinuousDecoder] ✅ FFmpeg process exited successfully")
+		logger.Debug("[ContinuousDecoder] FFmpeg process exited successfully")
 	}
 	
 	cd.mu.Lock()
@@ -526,7 +574,7 @@ func (cd *ContinuousDecoder) Stop() error {
 	failedCount := cd.failedCount
 	cd.mu.Unlock()
 	
-	log.Printf("[ContinuousDecoder] ✅ Stopped successfully (decoded: %d frames, failed: %d frames)", decodedCount, failedCount)
+	logger.Debug("[ContinuousDecoder] Stopped successfully (decoded: %d frames, failed: %d frames)", decodedCount, failedCount)
 	
 	return nil
 }
@@ -560,6 +608,9 @@ type FrameStorage struct {
 	// Continuous decoder session (matches documentation approach)
 	continuousDecoder *ContinuousDecoder
 	useContinuousMode bool // Enable continuous decoder session
+	
+	// Timestamp mapping for converting RTP timestamps to Unix epoch
+	timestampMapper *rtp.TimestampMapper
 }
 
 // NewFrameStorage creates a new frame storage handler
@@ -581,44 +632,39 @@ func NewFrameStorageWithOptions(outputDir string, saveAsJPG bool, continuousDeco
 	}
 
 	// Create output directory if it doesn't exist
-	fmt.Printf("📁 Creating output directory: %s\n", outputDir)
+	logger.Info("[FrameStorage] Creating output directory: %s", outputDir)
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create output directory: %w", err)
 	}
 
 	// Create separate directories for H.264 and JPEG files
 	h264Dir := filepath.Join(outputDir, "h264")
-	fmt.Printf("📁 Creating H.264 directory: %s\n", h264Dir)
+	logger.Info("[FrameStorage] Creating H.264 directory: %s", h264Dir)
 	if err := os.MkdirAll(h264Dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create H.264 directory: %w", err)
 	}
 
 	jpegDir := filepath.Join(outputDir, "jpeg")
-	fmt.Printf("📁 Creating JPEG directory: %s\n", jpegDir)
+	logger.Info("[FrameStorage] Creating JPEG directory: %s", jpegDir)
 	if err := os.MkdirAll(jpegDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create JPEG directory: %w", err)
 	}
 
 	// Create corrupted frames directory
 	corruptedFramesDir := filepath.Join(outputDir, "corrupted_frames")
-	fmt.Printf("📁 Creating corrupted frames directory: %s\n", corruptedFramesDir)
+	logger.Info("[FrameStorage] Creating corrupted frames directory: %s", corruptedFramesDir)
 	if err := os.MkdirAll(corruptedFramesDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create corrupted frames directory: %w", err)
 	}
 
 	// Create corrupted JPEG directory
 	corruptedJpegDir := filepath.Join(corruptedFramesDir, "jpeg")
-	fmt.Printf("📁 Creating corrupted JPEG directory: %s\n", corruptedJpegDir)
+	logger.Info("[FrameStorage] Creating corrupted JPEG directory: %s", corruptedJpegDir)
 	if err := os.MkdirAll(corruptedJpegDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create corrupted JPEG directory: %w", err)
 	}
 
-	fmt.Printf("✅ Directory structure created successfully:\n")
-	fmt.Printf("   %s/\n", outputDir)
-	fmt.Printf("   ├── h264/              (H.264 frame files)\n")
-	fmt.Printf("   ├── jpeg/              (JPEG image files)\n")
-	fmt.Printf("   └── corrupted_frames/ (Corrupted frames)\n")
-	fmt.Printf("       └── jpeg/          (Corrupted JPEG files)\n")
+	logger.Info("[FrameStorage] Directory structure created successfully: %s/ (h264/, jpeg/, corrupted_frames/jpeg/)", outputDir)
 
 	// Find ffmpeg if saving as JPG
 	var ffmpegPath string
@@ -626,15 +672,14 @@ func NewFrameStorageWithOptions(outputDir string, saveAsJPG bool, continuousDeco
 		path, err := exec.LookPath("ffmpeg")
 		if err != nil {
 			// FFmpeg not found, will save as H.264
-			fmt.Println("⚠️  JPEG mode requested but ffmpeg not found. Saving as H.264 only.")
-			fmt.Println("   Install ffmpeg to enable JPEG frame conversion: https://ffmpeg.org/download.html")
+			logger.Warn("[FrameStorage] JPEG mode requested but ffmpeg not found. Saving as H.264 only. Install ffmpeg to enable JPEG frame conversion: https://ffmpeg.org/download.html")
 			saveAsJPG = false
 		} else {
 			ffmpegPath = path
-			fmt.Println("✅ JPEG mode enabled - H.264 files will be saved in h264/ folder, JPEG images in jpeg/ folder")
+			logger.Info("[FrameStorage] JPEG mode enabled - H.264 files will be saved in h264/ folder, JPEG images in jpeg/ folder")
 		}
 	} else {
-		fmt.Println("📹 H.264 mode - saving frames as .h264 only")
+		logger.Info("[FrameStorage] H.264 mode - saving frames as .h264 only")
 	}
 
 	fs := &FrameStorage{
@@ -648,12 +693,13 @@ func NewFrameStorageWithOptions(outputDir string, saveAsJPG bool, continuousDeco
 		ffmpegPath:         ffmpegPath,
 		snapshotInterval:   90, // Extract JPG every 90 frames (about 1 per 3 seconds at 30fps)
 		useContinuousMode: continuousDecoder,
+		timestampMapper:    rtp.NewTimestampMapper(),
 	}
 	
 	if continuousDecoder && saveAsJPG && ffmpegPath != "" {
-		fmt.Println("✅ Continuous decoder mode enabled (can decode all frames including P-frames)")
+		logger.Info("[FrameStorage] Continuous decoder mode enabled (can decode all frames including P-frames)")
 	} else if saveAsJPG && ffmpegPath != "" {
-		fmt.Println("✅ Frame-by-frame decoder mode (keyframes only)")
+		logger.Info("[FrameStorage] Frame-by-frame decoder mode (keyframes only)")
 	}
 
 	// Create H.264 stream file for continuous writing
@@ -693,7 +739,7 @@ func (s *FrameStorage) SetSPSPPS(spsBase64, ppsBase64 string) error {
 	}
 
 	if len(s.spsNAL) > 0 && len(s.ppsNAL) > 0 {
-		fmt.Println("✅ SPS/PPS loaded from SDP for JPG conversion")
+		logger.Info("[FrameStorage] SPS/PPS loaded from SDP for JPG conversion")
 		
 		// Write SPS and PPS to stream file first
 		if s.streamFile != nil {
@@ -703,7 +749,7 @@ func (s *FrameStorage) SetSPSPPS(spsBase64, ppsBase64 string) error {
 		
 		// Initialize continuous decoder if enabled
 		if s.useContinuousMode && s.ffmpegPath != "" && s.continuousDecoder == nil {
-			log.Printf("[FrameStorage] Initializing continuous decoder with SPS/PPS...")
+			logger.Debug("[FrameStorage] Initializing continuous decoder with SPS/PPS...")
 			var err error
 			s.continuousDecoder, err = NewContinuousDecoder(
 				s.ffmpegPath,
@@ -711,19 +757,68 @@ func (s *FrameStorage) SetSPSPPS(spsBase64, ppsBase64 string) error {
 				s.corruptedJpegDir,
 				s.spsNAL,
 				s.ppsNAL,
+				s.getUnixTimestamp, // Pass timestamp converter function
 			)
 			if err != nil {
-				log.Printf("[FrameStorage] ❌ Failed to start continuous decoder: %v (falling back to frame-by-frame)", err)
-				fmt.Printf("⚠️  Failed to start continuous decoder: %v (falling back to frame-by-frame)\n", err)
+				logger.Error("[FrameStorage] Failed to start continuous decoder: %v (falling back to frame-by-frame)", err)
 				s.useContinuousMode = false
 			} else {
-				log.Printf("[FrameStorage] ✅ Continuous decoder initialized successfully")
-				fmt.Println("✅ Continuous decoder session started (can decode P-frames)")
+				logger.Info("[FrameStorage] Continuous decoder initialized successfully")
+				logger.Info("[FrameStorage] Continuous decoder session started (can decode P-frames)")
 			}
 		}
 	}
 
 	return nil
+}
+
+// UpdateTimestampMapping updates the RTP to Unix timestamp mapping from an RTCP Sender Report
+func (s *FrameStorage) UpdateTimestampMapping(sr *rtp.SenderReport) {
+	logger.Debug("[FrameStorage:UpdateTimestampMapping] Received RTCP Sender Report: SSRC=0x%x, RTP=%d, NTP=%d, Packets=%d, Octets=%d",
+		sr.SSRC, sr.RTPTimestamp, sr.NTPTimestamp, sr.PacketCount, sr.OctetCount)
+	
+	// Convert NTP to human-readable time for logging
+	if sr.NTPTimestamp != 0 {
+		ntpTime := rtp.NTPToTime(sr.NTPTimestamp)
+		logger.Debug("[FrameStorage:UpdateTimestampMapping] NTP Time (human-readable): %s", ntpTime.Format(time.RFC3339Nano))
+	}
+	
+	s.mu.Lock()
+	s.timestampMapper.UpdateFromSR(sr)
+	s.mu.Unlock()
+	
+	logger.Debug("[FrameStorage:UpdateTimestampMapping] Mapping update completed")
+}
+
+// getUnixTimestamp converts an RTP timestamp to Unix epoch timestamp (nanoseconds)
+// Returns the Unix timestamp in nanoseconds, or 0 if mapping is not yet available
+// Thread-safe: TimestampMapper is internally thread-safe, so we can call it without locks
+func (s *FrameStorage) getUnixTimestamp(rtpTimestamp uint32) int64 {
+	// Check mapper state
+	mapperState := s.timestampMapper.GetState()
+	if !mapperState.Initialized {
+		logger.Warn("[FrameStorage:getUnixTimestamp] Timestamp mapping not available: mapper not initialized yet. Need RTCP Sender Report. Current state: initialized=%t, rtpTimestamp=%d, ntpTimestamp=%d",
+			mapperState.Initialized, mapperState.RTPTimestamp, mapperState.NTPTimestamp)
+		return 0
+	}
+	
+	logger.Debug("[FrameStorage:getUnixTimestamp] Attempting conversion: RTP=%d, mapper has RTP=%d, NTP=%d, clockRate=%d",
+		rtpTimestamp, mapperState.RTPTimestamp, mapperState.NTPTimestamp, mapperState.ClockRate)
+	
+	// Convert RTP timestamp to NTP timestamp
+	// TimestampMapper.RTPToNTP is thread-safe internally
+	ntpTimestamp := s.timestampMapper.RTPToNTP(rtpTimestamp)
+	if ntpTimestamp == 0 {
+		logger.Warn("[FrameStorage:getUnixTimestamp] RTPToNTP returned 0 (mapping check failed)")
+		return 0
+	}
+	
+	// Convert NTP timestamp to Unix timestamp (nanoseconds)
+	unixTime := rtp.NTPToTime(ntpTimestamp)
+	unixNanos := unixTime.UnixNano()
+	logger.Debug("[FrameStorage:getUnixTimestamp] Conversion successful: RTP=%d -> NTP=%d -> Unix=%d (%s)",
+		rtpTimestamp, ntpTimestamp, unixNanos, unixTime.Format(time.RFC3339Nano))
+	return unixNanos
 }
 
 // decodeBase64 decodes base64 string
@@ -737,8 +832,13 @@ func (s *FrameStorage) SaveFrame(frame *decoder.Frame) error {
 		return ErrNilFrame
 	}
 
+	logger.Debug("[FrameStorage:SaveFrame] Acquiring lock for timestamp=%d", frame.Timestamp)
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	logger.Debug("[FrameStorage:SaveFrame] Lock acquired for timestamp=%d", frame.Timestamp)
+	defer func() {
+		logger.Debug("[FrameStorage:SaveFrame] Releasing lock for timestamp=%d", frame.Timestamp)
+		s.mu.Unlock()
+	}()
 
 	// Save each frame as individual H.264 file
 	// Also maintain continuous stream for potential video playback
@@ -756,7 +856,9 @@ func (s *FrameStorage) SaveFrame(frame *decoder.Frame) error {
 	} else {
 		h264TargetDir = s.h264Dir
 	}
-	h264Path := filepath.Join(h264TargetDir, s.getFilenameH264(frame.Timestamp, frame.IsCorrupted))
+	h264Filename := s.getFilenameH264(frame.Timestamp, frame.IsCorrupted)
+	h264Path := filepath.Join(h264TargetDir, h264Filename)
+	logger.Debug("[FrameStorage:SaveFrame] Saving H.264 frame: %s (timestamp: %d, size: %d bytes, keyframe: %t)", h264Path, frame.Timestamp, len(frame.Data), frame.IsKey)
 	if err := os.WriteFile(h264Path, frame.Data, 0644); err != nil {
 		return fmt.Errorf("failed to write frame file: %w", err)
 	}
@@ -766,7 +868,7 @@ func (s *FrameStorage) SaveFrame(frame *decoder.Frame) error {
 		if s.useContinuousMode && s.continuousDecoder != nil {
 			// Use continuous decoder session (matches documentation approach)
 			// This can decode all frames including P-frames, not just keyframes
-			log.Printf("[FrameStorage:SaveFrame] Feeding frame to continuous decoder: timestamp=%d, isKey=%t, corrupted=%t, size=%d",
+			logger.Debug("[FrameStorage:SaveFrame] Feeding frame to continuous decoder: timestamp=%d, isKey=%t, corrupted=%t, size=%d",
 				frame.Timestamp, frame.IsKey, frame.IsCorrupted, len(frame.Data))
 			s.continuousDecoder.FeedFrame(frame)
 		} else {
@@ -775,9 +877,11 @@ func (s *FrameStorage) SaveFrame(frame *decoder.Frame) error {
 			// P-frames depend on previous frames and cannot be decoded without reference frames
 			if !frame.IsCorrupted && frame.IsKey {
 				// Save JPEG to JPEG directory
-				jpgPath := filepath.Join(s.jpegDir, s.getFilenameJPEG(frame.Timestamp, false))
+				jpgFilename := s.getFilenameJPEG(frame.Timestamp, false)
+				jpgPath := filepath.Join(s.jpegDir, jpgFilename)
+				logger.Debug("[FrameStorage:SaveFrame] Decoding keyframe to JPEG: %s (RTP timestamp: %d)", jpgPath, frame.Timestamp)
 				if err := s.decodeFrameToJPEG(frame, jpgPath); err != nil {
-					fmt.Printf("⚠️  Failed to decode keyframe to JPEG: %v\n", err)
+					logger.Warn("[FrameStorage:SaveFrame] Failed to decode keyframe to JPEG: %v", err)
 				}
 			}
 		}
@@ -831,7 +935,7 @@ func (s *FrameStorage) Close() error {
 	
 	if s.continuousDecoder != nil {
 		if err := s.continuousDecoder.Stop(); err != nil {
-			fmt.Printf("⚠️  Error stopping continuous decoder: %v\n", err)
+			logger.Warn("[FrameStorage] Error stopping continuous decoder: %v", err)
 		}
 		s.continuousDecoder = nil
 	}
@@ -857,20 +961,63 @@ func (s *FrameStorage) getFilename(timestamp uint32, corrupted bool) string {
 	return fmt.Sprintf("%d%s", timestamp, ext)
 }
 
-// getFilenameH264 generates a filename for H.264 fallback
-func (s *FrameStorage) getFilenameH264(timestamp uint32, corrupted bool) string {
-	if corrupted {
-		return fmt.Sprintf("%d_corrupted.h264", timestamp)
+// getFilenameH264 generates a filename for H.264 using NTP timestamp in nanoseconds and RTP timestamp
+// Format: NTPNANOSECONDS.RTPTIMESTAMP.h264 (e.g., 1761897425257387428.1234567890.h264)
+// This preserves both NTP (wall-clock) time and RTP timestamp for correlation
+func (s *FrameStorage) getFilenameH264(rtpTimestamp uint32, corrupted bool) string {
+	unixNanos := s.getUnixTimestamp(rtpTimestamp)
+	if unixNanos == 0 {
+		// Fallback to RTP timestamp if mapping not available yet
+		filename := fmt.Sprintf("%d_corrupted.h264", rtpTimestamp)
+		if !corrupted {
+			filename = fmt.Sprintf("%d.h264", rtpTimestamp)
+		}
+		logger.Debug("[FrameStorage:getFilenameH264] Using RTP timestamp (mapping not available): %s (RTP timestamp: %d)", filename, rtpTimestamp)
+		return filename
 	}
-	return fmt.Sprintf("%d.h264", timestamp)
+	
+	// Format: ntpinnanoseconds.rtptimestamp.h264
+	// This preserves full nanosecond precision from RTCP NTP timestamps and RTP timestamp
+	filename := fmt.Sprintf("%d.%d_corrupted.h264", unixNanos, rtpTimestamp)
+	if !corrupted {
+		filename = fmt.Sprintf("%d.%d.h264", unixNanos, rtpTimestamp)
+	}
+	logger.Debug("[FrameStorage:getFilenameH264] Using NTP (nanoseconds).RTP timestamp: %s (NTP: %d, RTP: %d)", filename, unixNanos, rtpTimestamp)
+	return filename
 }
 
-// getFilenameJPEG generates a filename for JPEG output
-func (s *FrameStorage) getFilenameJPEG(timestamp uint32, corrupted bool) string {
-	if corrupted {
-		return fmt.Sprintf("%d_corrupted.jpg", timestamp)
+// getFilenameJPEG generates a filename for JPEG output using NTP timestamp in nanoseconds and RTP timestamp
+// Format: NTPNANOSECONDS.RTPTIMESTAMP.jpg (e.g., 1761897425257387428.1234567890.jpg)
+// This preserves both NTP (wall-clock) time and RTP timestamp for correlation
+func (s *FrameStorage) getFilenameJPEG(rtpTimestamp uint32, corrupted bool) string {
+	unixNanos := s.getUnixTimestamp(rtpTimestamp)
+	if unixNanos == 0 {
+		// Fallback to RTP timestamp if mapping not available yet
+		mapperState := s.timestampMapper.GetState()
+		logger.Warn("[FrameStorage:getFilenameJPEG] Cannot use Unix timestamp - mapping not available: RTP timestamp=%d, mapper initialized=%t",
+			rtpTimestamp, mapperState.Initialized)
+		if !mapperState.Initialized {
+			logger.Debug("[FrameStorage:getFilenameJPEG] Timestamp mapper not initialized. Need RTCP Sender Report (SR) packet to initialize mapping. Check: RTCP packets being received, RTCP Sender Report (type 200) received, ReadRTCP() working, UpdateTimestampMapping() called")
+		} else {
+			logger.Debug("[FrameStorage:getFilenameJPEG] Mapper initialized: RTP=%d, NTP=%d, clockRate=%d", mapperState.RTPTimestamp, mapperState.NTPTimestamp, mapperState.ClockRate)
+			logger.Warn("[FrameStorage:getFilenameJPEG] Conversion failed for unknown reason")
+		}
+		filename := fmt.Sprintf("%d_corrupted.jpg", rtpTimestamp)
+		if !corrupted {
+			filename = fmt.Sprintf("%d.jpg", rtpTimestamp)
+		}
+		logger.Debug("[FrameStorage:getFilenameJPEG] Using RTP timestamp fallback: %s", filename)
+		return filename
 	}
-	return fmt.Sprintf("%d.jpg", timestamp)
+	
+	// Format: ntpinnanoseconds.rtptimestamp.jpg
+	// This preserves full nanosecond precision from RTCP NTP timestamps and RTP timestamp
+	filename := fmt.Sprintf("%d.%d_corrupted.jpg", unixNanos, rtpTimestamp)
+	if !corrupted {
+		filename = fmt.Sprintf("%d.%d.jpg", unixNanos, rtpTimestamp)
+	}
+	logger.Debug("[FrameStorage:getFilenameJPEG] Using NTP (nanoseconds).RTP timestamp: %s (NTP: %d, RTP: %d)", filename, unixNanos, rtpTimestamp)
+	return filename
 }
 
 // decodeFrameToJPEG decodes an H.264 frame (complete NAL units) to JPEG image

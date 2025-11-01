@@ -1,0 +1,40 @@
+# RTSP Client Configuration File
+# This is an example configuration file for rtsp-client
+# Copy this file and modify as needed: cp rtsp-client.yml.example rtsp-client.yml
+# Usage: rtsp-client rtsp-client.yml
+
+# RTSP stream URL (required)
+# This is the URL of the RTSP stream to connect to
+rtsp_url: "rtsp://192.168.1.100:554/stream"
+
+# Output directory for saved frames
+# Frames will be saved in H.264 format and optionally as JPEG images
+output_dir: "./frames"
+
+# Connection timeout
+# Duration format: "10s", "30s", "1m", etc.
+timeout: "10s"
+
+# Log level
+# Options: error, warn, info, debug
+# Default: info
+# error: Only shows error messages
+# warn: Shows warnings and errors
+# info: Shows informational messages, warnings, and errors (default)
+# debug: Shows all messages including detailed debug information
+log_level: "info"
+
+# Enable verbose logging (deprecated: use log_level: "debug" instead)
+# Kept for backward compatibility
+verbose: false
+
+# Save frames as JPEG images (requires ffmpeg)
+# If true, frames will be saved both as H.264 and JPEG
+# If false, only H.264 files will be saved
+save_jpeg: true
+
+# Continuous decoder mode
+# If true, uses continuous decoder session (can decode P-frames)
+# If false, uses frame-by-frame mode (keyframes only)
+continuous_decoder: true
+

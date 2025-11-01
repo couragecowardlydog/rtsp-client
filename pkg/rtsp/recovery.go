@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/rtsp-client/pkg/logger"
 )
 
 // RetryConfig holds configuration for retry/recovery logic
@@ -234,7 +236,7 @@ func (c *Client) AutoReconnect(interval time.Duration) {
 					// Connection lost, attempt recovery
 					if err := c.RecoverSession(); err != nil {
 						// Log error (in production, use proper logger)
-						fmt.Printf("Auto-reconnect failed: %v\n", err)
+						logger.Warn("[Recovery] Auto-reconnect failed: %v", err)
 					}
 				}
 			case <-c.ctx.Done():
